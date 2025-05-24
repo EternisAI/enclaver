@@ -1,0 +1,9 @@
+# vim swap files
+[._]*.sw[a-p]
+# vim temporary files / common backups
+*~
+
+# MacOS extended attributes
+._*
+# MacOS Desktop Services Store
+.DS_Store
