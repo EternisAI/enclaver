@@ -192,7 +192,7 @@ impl NitroCLIArgs for RunEnclaveArgs {
 
         if let Some(cid) = self.cid {
             args.push("--enclave-cid".into());
-            args.push(format!("{}", cid).into());
+            args.push(format!("{cid}").into());
         }
 
         if self.debug_mode {

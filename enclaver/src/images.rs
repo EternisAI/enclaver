@@ -61,7 +61,7 @@ impl ImageManager {
             .docker
             .inspect_image(name)
             .await
-            .with_context(|| format!("inspecting image {}", name))?;
+            .with_context(|| format!("inspecting image {name}"))?;
 
         match img.id {
             Some(id) => Ok(ImageRef { id }),
@@ -230,18 +230,18 @@ impl FileBuilder {
 
         match &self.source {
             FileSource::Local { .. } => {
-                write!(&mut line, " files/{}", local_path)?;
+                write!(&mut line, " files/{local_path}")?;
             }
             FileSource::Image {
                 name: image_name,
                 path,
             } => {
                 let src_path = path.must_to_str()?;
-                write!(&mut line, " --from={} {}", image_name, src_path)?;
+                write!(&mut line, " --from={image_name} {src_path}")?;
             }
         }
 
-        writeln!(&mut line, " {}", dst_path)?;
+        writeln!(&mut line, " {dst_path}")?;
 
         Ok(line)
     }
@@ -324,7 +324,7 @@ impl LayerBuilder {
         if let Some(entrypoint) = &self.entrypoint {
             let ep_array_str = serde_json::to_string(entrypoint)?;
             trace!("writing ENTRYPOINT: {}", ep_array_str);
-            dw.write_all(format!("ENTRYPOINT {}\n", ep_array_str).as_bytes())
+            dw.write_all(format!("ENTRYPOINT {ep_array_str}\n").as_bytes())
                 .await?;
         }
 

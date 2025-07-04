@@ -61,7 +61,7 @@ impl HttpServer {
                     )
                     .await
                 {
-                    eprintln!("Error serving connection: {:?}", err);
+                    eprintln!("Error serving connection: {err:?}");
                 }
             });
         }

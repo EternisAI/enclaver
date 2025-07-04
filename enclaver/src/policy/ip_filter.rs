@@ -106,7 +106,7 @@ mod tests {
             let pos = tc.positives.iter().map(|a| a.parse::<IpAddr>().unwrap());
 
             for a in pos {
-                println!("pattern={:?}, addr={}", pat, a);
+                println!("pattern={pat:?}, addr={a}");
                 assert!(pat.matches(a));
             }
 

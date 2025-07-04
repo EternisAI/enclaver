@@ -21,8 +21,8 @@ pub enum ExitStatus {
 impl std::fmt::Display for ExitStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         match self {
-            ExitStatus::Exited(code) => write!(f, "exited with {}", code),
-            ExitStatus::Signaled(sig) => write!(f, "terminated by {}", sig),
+            ExitStatus::Exited(code) => write!(f, "exited with {code}"),
+            ExitStatus::Signaled(sig) => write!(f, "terminated by {sig}"),
         }
     }
 }
