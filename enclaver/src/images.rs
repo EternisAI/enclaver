@@ -134,9 +134,8 @@ impl ImageManager {
         // pair of streams, and lazily write the tarball to one of them while streaming
         // the other end of the pipe into the daemon request.
         let (tar_write, tar_read) = duplex(1024);
-        let byte_stream = codec::FramedRead::new(tar_read, codec::BytesCodec::new()).map(|r| {
-            r.unwrap().freeze()
-        });
+        let byte_stream =
+            codec::FramedRead::new(tar_read, codec::BytesCodec::new()).map(|r| r.unwrap().freeze());
 
         // Concurrently build the context tarball and perform the build request.
         let (realize_res, build_res) = tokio::join!(

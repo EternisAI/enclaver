@@ -137,7 +137,10 @@ impl Enclave {
 
         self.enclave_info = Some(enclave_info.clone());
 
-        info!("started enclave ID={}, CID={}", enclave_info.id, enclave_info.cid);
+        info!(
+            "started enclave ID={}, CID={}",
+            enclave_info.id, enclave_info.cid
+        );
 
         if self.debug_mode {
             // TODO: Should we let an an EOF from the console terminate run?

@@ -9,7 +9,7 @@ use enclaver::http_util::HttpServer;
 use enclaver::keypair::KeyPair;
 use enclaver::nsm::{Nsm, NsmAttestationProvider};
 use enclaver::proxy::aws_util;
-use enclaver::proxy::kms::{KmsProxyConfig, KmsProxyHandler, CredentialsGetter};
+use enclaver::proxy::kms::{CredentialsGetter, KmsProxyConfig, KmsProxyHandler};
 
 use crate::config::Configuration;
 

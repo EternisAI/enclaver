@@ -24,6 +24,10 @@ jobs:
       - name: Install Clippy and Rustfmt
         run: rustup component add clippy rustfmt
 
+      - name: Check code formatting
+        run: |
+          cargo fmt --check --manifest-path enclaver/Cargo.toml
+
       - name: Check with default features
         run: |
           cargo clippy --quiet --no-deps --manifest-path enclaver/Cargo.toml

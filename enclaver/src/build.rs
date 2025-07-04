@@ -6,7 +6,7 @@ use crate::manifest::{load_manifest, Manifest};
 use crate::nitro_cli::{EIFInfo, KnownIssue};
 use anyhow::{anyhow, Result};
 use bollard::container::{Config, LogOutput, LogsOptions, WaitContainerOptions};
-use bollard::models::{ImageConfig, HostConfig, Mount, MountTypeEnum};
+use bollard::models::{HostConfig, ImageConfig, Mount, MountTypeEnum};
 use bollard::Docker;
 use futures_util::stream::{StreamExt, TryStreamExt};
 use log::{debug, info, warn};
@@ -96,7 +96,8 @@ impl EnclaveArtifactBuilder {
 
         if let Some(signature) = &manifest.signature {
             if let Some(parent_path) = PathBuf::from(manifest_path).parent() {
-                certificate_path = Some(canonicalize(parent_path.join(&signature.certificate)).await?);
+                certificate_path =
+                    Some(canonicalize(parent_path.join(&signature.certificate)).await?);
                 key_path = Some(canonicalize(parent_path.join(&signature.key)).await?);
             } else {
                 return Err(anyhow!("Failed to get parent path of manifest"));
@@ -104,7 +105,13 @@ impl EnclaveArtifactBuilder {
         }
 
         let eif_info = self
-            .image_to_eif(&amended_img, &build_dir, EIF_FILE_NAME, key_path, certificate_path)
+            .image_to_eif(
+                &amended_img,
+                &build_dir,
+                EIF_FILE_NAME,
+                key_path,
+                certificate_path,
+            )
             .await?;
 
         Ok(IntermediateBuildResult {
@@ -237,7 +244,7 @@ impl EnclaveArtifactBuilder {
         build_dir: &TempDir,
         eif_name: &str,
         key: Option<PathBuf>,
-        certificate: Option<PathBuf>
+        certificate: Option<PathBuf>,
     ) -> Result<EIFInfo> {
         let build_dir_path = build_dir.path().to_str().unwrap();
 
@@ -287,7 +294,6 @@ impl EnclaveArtifactBuilder {
             cmd.push("/var/run/certificate");
             cmd.push("--private-key");
             cmd.push("/var/run/key");
-
 
             mounts.push(Mount {
                 typ: Some(MountTypeEnum::BIND),
