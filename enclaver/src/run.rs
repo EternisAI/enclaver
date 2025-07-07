@@ -1,6 +1,6 @@
 use crate::constants::{
-    APP_LOG_PORT, EIF_FILE_NAME, HTTP_EGRESS_VSOCK_PORT, MANIFEST_FILE_NAME, RELEASE_BUNDLE_DIR,
-    STATUS_PORT,
+    APP_LOG_PORT, EIF_FILE_NAME, ENV_SYNC_PORT, HTTP_EGRESS_VSOCK_PORT, MANIFEST_FILE_NAME,
+    RELEASE_BUNDLE_DIR, STATUS_PORT,
 };
 use crate::manifest::{load_manifest, Defaults, Manifest};
 use crate::utils;
@@ -8,9 +8,12 @@ use anyhow::{anyhow, Result};
 use futures_util::stream::StreamExt;
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::sync::CancellationToken;
 use tokio_vsock::VsockStream;
@@ -19,6 +22,7 @@ use crate::nitro_cli::{EnclaveInfo, NitroCLI, RunEnclaveArgs};
 use crate::proxy::egress_http::HostHttpProxy;
 use crate::proxy::ingress::HostProxy;
 
+const ENV_VSOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const LOG_VSOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_VSOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_VSOCK_RETRY_LIMIT: i32 = 100;
@@ -147,6 +151,8 @@ impl Enclave {
             self.attach_debug_console(&enclave_info.id).await?;
         }
 
+        self.start_env_sync(enclave_info.cid)?;
+
         self.start_odyn_log_stream(enclave_info.cid)?;
 
         self.start_ingress_proxies(enclave_info.cid).await?;
@@ -212,6 +218,38 @@ impl Enclave {
         self.tasks.push(utils::spawn!("egress proxy", async move {
             proxy.serve().await;
         })?);
+
+        Ok(())
+    }
+
+    fn start_env_sync(&mut self, cid: u32) -> Result<()> {
+        if let Some(ref keys) = self.manifest.env {
+            if !keys.is_empty() {
+                let vars = keys
+                    .iter()
+                    .filter_map(|k| env::var(k).ok().map(|v| (k.clone(), v)))
+                    .collect::<HashMap<_, _>>();
+                let env = serde_json::to_string(&vars)?;
+
+                self.tasks
+                    .push(utils::spawn!("sync environment", async move {
+                        info!("waiting for enclave to boot to sync environment");
+                        let mut conn = loop {
+                            match VsockStream::connect(cid, ENV_SYNC_PORT).await {
+                                Ok(conn) => break conn,
+                                // TODO: improve the polling frequency / backoff / timeout
+                                Err(_) => tokio::time::sleep(ENV_VSOCK_RETRY_INTERVAL).await,
+                            }
+                        };
+
+                        info!("connected to enclave, starting environment sync");
+                        if let Err(err) = conn.write_all(env.as_bytes()).await {
+                            error!("error sending environment to enclave: {err}");
+                        }
+                        info!("environment sync complete");
+                    })?);
+            }
+        }
 
         Ok(())
     }

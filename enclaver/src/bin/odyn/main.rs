@@ -9,13 +9,15 @@ pub mod ingress;
 pub mod kms_proxy;
 pub mod launcher;
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use log::{error, info};
+use log::{error, info, warn};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::Arc;
+use tokio::time;
 
-use enclaver::constants::{APP_LOG_PORT, STATUS_PORT};
+use enclaver::constants::{APP_LOG_PORT, ENV_SYNC_PORT, STATUS_PORT};
 use enclaver::nsm::Nsm;
 
 use api::ApiService;
@@ -24,6 +26,8 @@ use console::{AppLog, AppStatus};
 use egress::EgressService;
 use ingress::IngressService;
 use kms_proxy::KmsProxyService;
+
+const ENV_SYNC_TIMEOUT: time::Duration = time::Duration::from_secs(10);
 
 #[derive(Parser)]
 struct CliArgs {
@@ -57,11 +61,12 @@ async fn launch(args: &CliArgs) -> Result<launcher::ExitStatus> {
     let ingress = IngressService::start(&config)?;
     let kms_proxy = KmsProxyService::start(config.clone(), nsm.clone()).await?;
     let api = ApiService::start(&config, nsm.clone()).await?;
+    let env = sync_environment(&config).await?;
 
     let creds = launcher::Credentials { uid: 0, gid: 0 };
 
     info!("Starting {:?}", args.entrypoint);
-    let exit_status = launcher::start_child(args.entrypoint.clone(), creds).await??;
+    let exit_status = launcher::start_child(args.entrypoint.clone(), creds, env).await??;
     info!("Entrypoint {}", exit_status);
 
     api.stop().await;
@@ -70,6 +75,69 @@ async fn launch(args: &CliArgs) -> Result<launcher::ExitStatus> {
     egress.stop().await;
 
     Ok(exit_status)
+}
+
+async fn sync_environment(config: &Configuration) -> Result<HashMap<String, String>> {
+    use futures::stream::StreamExt;
+    use tokio::io::AsyncReadExt;
+
+    let mut env: HashMap<String, String> = HashMap::new();
+
+    if let Some(ref keys) = config.manifest.env {
+        if !keys.is_empty() {
+            info!("Starting the environment sync");
+
+            let mut incoming = enclaver::vsock::serve(ENV_SYNC_PORT)?;
+
+            match time::timeout(ENV_SYNC_TIMEOUT, incoming.next()).await {
+                Ok(Some(mut sock)) => {
+                    let mut env_buf: Vec<u8> = Vec::new();
+                    let mut read_buf = vec![0u8; 1024];
+                    const ARG_MAX: usize = 128 * 1024;
+
+                    loop {
+                        match time::timeout(ENV_SYNC_TIMEOUT, sock.read(&mut read_buf)).await {
+                            Ok(Ok(0)) => break,
+                            Ok(Ok(n)) => {
+                                if env_buf.len() + n > ARG_MAX {
+                                    return Err(anyhow!("Maximum environment size exceeded"));
+                                }
+                                env_buf.extend_from_slice(&read_buf[..n]);
+                            }
+                            Ok(Err(err)) => {
+                                return Err(anyhow!("Error reading environment: {:#}", err))
+                            }
+                            Err(_) => return Err(anyhow!("Timed out while reading environment")),
+                        }
+                    }
+
+                    let mut synced_env: HashMap<String, String> = serde_json::from_slice(&env_buf)
+                        .context("Failed to parse the synced environment")?;
+
+                    for k in keys.iter() {
+                        if let Some(v) = synced_env.remove(k) {
+                            info!("Syncing environment variable: {}", k);
+                            env.insert(k.clone(), v);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    return Err(anyhow!(
+                        "Failed to accept environment sync vsock connection"
+                    ));
+                }
+                Err(_) => {
+                    return Err(anyhow!("Timed out while waiting for environment sync"));
+                }
+            }
+
+            info!("Environment sync complete");
+        } else {
+            warn!("The list of environment keys in the manifest is empty, skipping the sync");
+        }
+    }
+
+    Ok(env)
 }
 
 async fn run(args: &CliArgs) -> Result<()> {

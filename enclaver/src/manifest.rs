@@ -23,6 +23,7 @@ pub struct Manifest {
     pub defaults: Option<Defaults>,
     pub kms_proxy: Option<KmsProxy>,
     pub api: Option<Api>,
+    pub env: Option<Vec<String>>,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]

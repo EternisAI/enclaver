@@ -3,6 +3,7 @@ use log::debug;
 use nix::sys::signal::Signal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -28,12 +29,17 @@ impl std::fmt::Display for ExitStatus {
 }
 
 // runs the child and reaps all of its children as well
-pub fn run_child(argv: &[OsString], creds: &Credentials) -> Result<ExitStatus> {
+pub fn run_child(
+    argv: &[OsString],
+    creds: &Credentials,
+    env: &HashMap<String, String>,
+) -> Result<ExitStatus> {
     // Don't use tokio::process::Command because it wants to reap the process.
     // However we need to run waitpid() ourselves to reap the zombies and it'll
     // end up picking up the spawned child as well.
     let child = Command::new(&argv[0])
         .args(&argv[1..])
+        .envs(env)
         .uid(creds.uid)
         .gid(creds.gid)
         .process_group(0)
@@ -46,8 +52,12 @@ pub fn run_child(argv: &[OsString], creds: &Credentials) -> Result<ExitStatus> {
 }
 
 // runs the child and reaps all of its children as well
-pub fn start_child(argv: Vec<OsString>, creds: Credentials) -> JoinHandle<Result<ExitStatus>> {
-    tokio::task::spawn_blocking(move || run_child(&argv, &creds))
+pub fn start_child(
+    argv: Vec<OsString>,
+    creds: Credentials,
+    env: HashMap<String, String>,
+) -> JoinHandle<Result<ExitStatus>> {
+    tokio::task::spawn_blocking(move || run_child(&argv, &creds, &env))
 }
 
 // Reap processes until a process with sentinel pid exits.
