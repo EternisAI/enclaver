@@ -26,6 +26,9 @@ pub mod nsm;
 #[cfg(feature = "odyn")]
 pub mod api;
 
+#[cfg(any(feature = "odyn", feature = "proxy"))]
+pub mod json_transport;
+
 #[cfg(feature = "proxy")]
 pub mod proxy;
 
