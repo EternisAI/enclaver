@@ -1,6 +1,6 @@
 use crate::constants::{
-    APP_LOG_PORT, EIF_FILE_NAME, ENV_SYNC_PORT, HTTP_EGRESS_VSOCK_PORT, MANIFEST_FILE_NAME,
-    RELEASE_BUNDLE_DIR, STATUS_PORT,
+    APP_LOG_PORT, EIF_FILE_NAME, ENV_SYNC_PORT, FILE_SYNC_PORT, HTTP_EGRESS_VSOCK_PORT,
+    MANIFEST_FILE_NAME, RELEASE_BUNDLE_DIR, STATUS_PORT,
 };
 use crate::manifest::{load_manifest, Defaults, Manifest};
 use crate::utils;
@@ -8,21 +8,24 @@ use anyhow::{anyhow, Result};
 use futures_util::stream::StreamExt;
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::sync::CancellationToken;
 use tokio_vsock::VsockStream;
 
+use crate::files;
 use crate::nitro_cli::{EnclaveInfo, NitroCLI, RunEnclaveArgs};
 use crate::proxy::egress_http::HostHttpProxy;
 use crate::proxy::ingress::HostProxy;
 
 const ENV_VSOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const FILE_VSOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const LOG_VSOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_VSOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_VSOCK_RETRY_LIMIT: i32 = 100;
@@ -153,6 +156,8 @@ impl Enclave {
 
         self.start_env_sync(enclave_info.cid)?;
 
+        self.start_file_sync(enclave_info.cid)?;
+
         self.start_odyn_log_stream(enclave_info.cid)?;
 
         self.start_ingress_proxies(enclave_info.cid).await?;
@@ -250,6 +255,51 @@ impl Enclave {
                     })?);
             }
         }
+
+        Ok(())
+    }
+
+    fn start_file_sync(&mut self, cid: u32) -> Result<()> {
+        let mut files = HashSet::new();
+
+        if let Some(ref manifest_files) = self.manifest.files {
+            for file_path in manifest_files {
+                files.insert(file_path.clone());
+            }
+        }
+
+        if files.is_empty() {
+            info!("no files defined, no file sync client will be started");
+            return Ok(());
+        }
+
+        let mut watcher = files::Watcher::new(&files)?;
+        let (sync_tx, mut sync_rx) = mpsc::unbounded_channel::<files::Watch>();
+
+        info!("starting file sync watcher");
+        self.tasks
+            .push(utils::spawn!("file sync watcher", async move {
+                watcher.run(sync_tx).await;
+            })?);
+
+        info!("starting file sync client");
+        self.tasks
+            .push(utils::spawn!("file sync client", async move {
+                info!("waiting for enclave to boot to sync files");
+                loop {
+                    match VsockStream::connect(cid, FILE_SYNC_PORT).await {
+                        Ok(_) => break,
+                        // TODO: improve the polling frequency / backoff / timeout
+                        Err(_) => tokio::time::sleep(FILE_VSOCK_RETRY_INTERVAL).await,
+                    }
+                }
+
+                while let Some(ref watch) = sync_rx.recv().await {
+                    if let Err(err) = files::sync_watched_file(cid, watch).await {
+                        error!("file sync error for {}: {}", watch, err);
+                    }
+                }
+            })?);
 
         Ok(())
     }

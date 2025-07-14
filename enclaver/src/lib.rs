@@ -20,6 +20,9 @@ pub mod run_container;
 #[cfg(feature = "run_enclave")]
 pub mod run;
 
+#[cfg(any(feature = "run_enclave", feature = "odyn"))]
+pub mod files;
+
 #[cfg(feature = "odyn")]
 pub mod nsm;
 

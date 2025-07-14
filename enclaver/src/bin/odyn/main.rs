@@ -5,6 +5,7 @@ pub mod config;
 pub mod console;
 pub mod egress;
 pub mod enclave;
+pub mod file_sync;
 pub mod ingress;
 pub mod kms_proxy;
 pub mod launcher;
@@ -24,6 +25,7 @@ use api::ApiService;
 use config::Configuration;
 use console::{AppLog, AppStatus};
 use egress::EgressService;
+use file_sync::FileSyncService;
 use ingress::IngressService;
 use kms_proxy::KmsProxyService;
 
@@ -62,6 +64,7 @@ async fn launch(args: &CliArgs) -> Result<launcher::ExitStatus> {
     let kms_proxy = KmsProxyService::start(config.clone(), nsm.clone()).await?;
     let api = ApiService::start(&config, nsm.clone()).await?;
     let env = sync_environment(&config).await?;
+    let file_sync = FileSyncService::start(&config).await?;
 
     let creds = launcher::Credentials { uid: 0, gid: 0 };
 
@@ -69,6 +72,7 @@ async fn launch(args: &CliArgs) -> Result<launcher::ExitStatus> {
     let exit_status = launcher::start_child(args.entrypoint.clone(), creds, env).await??;
     info!("Entrypoint {}", exit_status);
 
+    file_sync.stop().await;
     api.stop().await;
     kms_proxy.stop().await;
     ingress.stop().await;

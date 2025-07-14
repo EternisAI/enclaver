@@ -81,6 +81,20 @@ impl EnclaveArtifactBuilder {
 
         self.analyze_manifest(&manifest);
 
+        if let Some(ref files) = &manifest.files {
+            for path in files.iter() {
+                if PathBuf::from(path).components().any(|component| {
+                    component == std::path::Component::ParentDir
+                        || component == std::path::Component::CurDir
+                }) {
+                    return Err(anyhow!(
+                        "File path with relative components in manifest: {}",
+                        path,
+                    ));
+                }
+            }
+        }
+
         let resolved_sources = self.resolve_sources(&manifest).await?;
 
         let amended_img = self

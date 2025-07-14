@@ -24,6 +24,7 @@ pub struct Manifest {
     pub kms_proxy: Option<KmsProxy>,
     pub api: Option<Api>,
     pub env: Option<Vec<String>>,
+    pub files: Option<Vec<String>>,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]

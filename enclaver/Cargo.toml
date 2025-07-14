@@ -34,6 +34,7 @@ base64 = "0.13"
 bollard = { git = "https://github.com/fussybeaver/bollard.git", branch = "master" }
 bytes = "1.6"
 cbc = { version = "0.1", features = [ "std", "block-padding" ] }
+chrono = "0.4"
 circbuf = "0.2"
 clap = { version = "4.5.31", features = ["derive"] }
 console-subscriber = { version = "0.1.10", optional = true }
@@ -52,6 +53,7 @@ json = "0.12"
 lazy_static = "1.5"
 log = "0.4"
 nix = "0.24"
+notify-debouncer-full = "0.5"
 pkcs8 = { version = "0.9", features = ["pem"] }
 pretty_env_logger = "0.5"
 rand = { version = "0.8", features = ["std", "std_rng"] }
