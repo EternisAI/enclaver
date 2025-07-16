@@ -3,7 +3,7 @@ name: Build Release
 on:
   push:
     branches:
-      - main
+      - eternis
     tags:
       - v*
 
@@ -75,7 +75,7 @@ jobs:
 
 
   publish-images:
-    if: github.repository == 'edgebitio/enclaver' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag')
+    if: github.repository == 'EternisAI/enclaver' && (github.ref == 'refs/heads/eternis' || github.ref_type == 'tag')
     needs: build-release-binaries
     runs-on: ubuntu-latest
 
@@ -101,21 +101,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
-      - name: Authenticate to Google Cloud
-        uses: 'google-github-actions/auth@v2'
-        with:
-          workload_identity_provider: 'projects/77991489452/locations/global/workloadIdentityPools/gh-actions-identity-pool/providers/gh-actions-identity-provider'
-          service_account: 'github-actions-service-account@edgebit-containers.iam.gserviceaccount.com'
-
-      - name: Configure GCP Docker Auth
-        run: |
-          gcloud auth configure-docker us-docker.pkg.dev
-
       - name: Authenticate to AWS
         uses: aws-actions/configure-aws-credentials@v1-node16
         with:
           aws-region: us-east-1
-          role-to-assume: arn:aws:iam::970625735569:role/GitHubActionsECRPush
+          role-to-assume: arn:aws:iam::314146293458:role/github-ci-enclaver
 
       - name: Configure AWS Docker Auth
         id: login-ecr
@@ -128,13 +118,10 @@ jobs:
         uses: docker/metadata-action@v4
         with:
           images: |
-            us-docker.pkg.dev/edgebit-containers/containers/odyn
-            public.ecr.aws/p0s1m1r8/odyn
+            public.ecr.aws/f5z1z8p0/odyn
           tags: |
             type=sha,
-            type=semver,pattern=v{{major}}
-            type=semver,pattern=v{{major}}.{{minor}}
-            type=semver,pattern=v{{major}}.{{minor}}.{{patch}}
+            type=semver,pattern={{raw}}
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
 
       - name: Build Odyn Image
@@ -152,13 +139,10 @@ jobs:
         uses: docker/metadata-action@v4
         with:
           images: |
-            us-docker.pkg.dev/edgebit-containers/containers/enclaver-wrapper-base
-            public.ecr.aws/p0s1m1r8/enclaver-wrapper-base
+            public.ecr.aws/f5z1z8p0/enclaver-wrapper-base
           tags: |
             type=sha,
-            type=semver,pattern=v{{major}}
-            type=semver,pattern=v{{major}}.{{minor}}
-            type=semver,pattern=v{{major}}.{{minor}}.{{patch}}
+            type=semver,pattern={{raw}}
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
 
       - name: Build Runtime Base Image
@@ -172,7 +156,7 @@ jobs:
           tags: ${{ steps.wrapper-base-metadata.outputs.tags }}
 
   upload-release-artifact:
-    if: github.repository == 'edgebitio/enclaver' && github.ref_type == 'tag'
+    if: github.repository == 'EternisAI/enclaver' && github.ref_type == 'tag'
     needs: build-release-binaries
     runs-on: ubuntu-latest
 
