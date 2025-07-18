@@ -139,6 +139,7 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
 
       - name: Build Odyn Image
+        id: odyn-image
         uses: docker/build-push-action@v3
         with:
           context: "{{defaultContext}}:build/dockerfiles"
@@ -149,14 +150,12 @@ jobs:
           tags: ${{ steps.odyn-metadata.outputs.tags }}
 
       - name: Sign Odyn Image
-        run: |
-          for tag in $tags
-          do
-            cosign sign --yes --identity-token "$COSIGN_OIDC_TOKEN" "$tag"
-          done
+        run: >-
+          cosign sign --yes --identity-token "$COSIGN_OIDC_TOKEN"
+          "public.ecr.aws/f5z1z8p0/odyn@$DIGEST"
         env:
-          tags: ${{ steps.odyn-metadata.outputs.tags }}
           COSIGN_OIDC_TOKEN: ${{ steps.cosign-token.outputs.token }}
+          DIGEST: ${{ steps.odyn-image.outputs.digest }}
 
       - name: Generate Runtime Base Image Metadata
         id: wrapper-base-metadata
@@ -170,6 +169,7 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
 
       - name: Build Runtime Base Image
+        id: wrapper-base-image
         uses: docker/build-push-action@v3
         with:
           context: "{{defaultContext}}:build/dockerfiles"
@@ -180,14 +180,12 @@ jobs:
           tags: ${{ steps.wrapper-base-metadata.outputs.tags }}
 
       - name: Sign Runtime Base Image
-        run: |
-          for tag in $tags
-          do
-            cosign sign --yes --identity-token "$COSIGN_OIDC_TOKEN" "$tag"
-          done
+        run: >-
+          cosign sign --yes --identity-token "$COSIGN_OIDC_TOKEN"
+          "public.ecr.aws/f5z1z8p0/enclaver-wrapper-base@$DIGEST"
         env:
-          tags: ${{ steps.wrapper-base-metadata.outputs.tags }}
           COSIGN_OIDC_TOKEN: ${{ steps.cosign-token.outputs.token }}
+          DIGEST: ${{ steps.wrapper-base-image.outputs.digest }}
 
       - name: Generate CLI Image Metadata
         id: cli-metadata
@@ -201,6 +199,7 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
 
       - name: Build CLI Image
+        id: cli-image
         uses: docker/build-push-action@v3
         with:
           context: "{{defaultContext}}:build/dockerfiles"
@@ -211,14 +210,12 @@ jobs:
           tags: ${{ steps.cli-metadata.outputs.tags }}
 
       - name: Sign CLI Image
-        run: |
-          for tag in $tags
-          do
-            cosign sign --yes --identity-token "$COSIGN_OIDC_TOKEN" "$tag"
-          done
+        run: >-
+          cosign sign --yes --identity-token "$COSIGN_OIDC_TOKEN"
+          "public.ecr.aws/f5z1z8p0/enclaver@$DIGEST"
         env:
-          tags: ${{ steps.cli-metadata.outputs.tags }}
           COSIGN_OIDC_TOKEN: ${{ steps.cosign-token.outputs.token }}
+          DIGEST: ${{ steps.cli-image.outputs.digest }}
 
   upload-release-artifact:
     if: github.repository == 'EternisAI/enclaver' && github.ref_type == 'tag'
