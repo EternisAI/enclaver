@@ -155,6 +155,27 @@ jobs:
           push: true
           tags: ${{ steps.wrapper-base-metadata.outputs.tags }}
 
+      - name: Generate CLI Image Metadata
+        id: cli-metadata
+        uses: docker/metadata-action@v4
+        with:
+          images: |
+            public.ecr.aws/f5z1z8p0/enclaver
+          tags: |
+            type=sha,
+            type=semver,pattern={{raw}}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+
+      - name: Build CLI Image
+        uses: docker/build-push-action@v3
+        with:
+          context: "{{defaultContext}}:build/dockerfiles"
+          build-contexts: artifacts=.
+          file: cli.dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.cli-metadata.outputs.tags }}
+
   upload-release-artifact:
     if: github.repository == 'EternisAI/enclaver' && github.ref_type == 'tag'
     needs: build-release-binaries

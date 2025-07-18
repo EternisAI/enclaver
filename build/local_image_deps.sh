@@ -19,6 +19,7 @@ esac
 enclaver_dir="$(dirname $(dirname ${BASH_SOURCE[0]}))/enclaver"
 rust_target_dir="./target/${rust_target}/debug"
 
+cli_tag="enclaver:latest"
 odyn_tag="odyn-dev:latest"
 wrapper_base_tag="enclaver-wrapper-base:latest"
 
@@ -30,7 +31,13 @@ trap "rm --force --recursive ${docker_build_dir}" EXIT
 cargo build --target $rust_target --features run_enclave,odyn
 
 cp $rust_target_dir/odyn $docker_build_dir/
+cp $rust_target_dir/enclaver $docker_build_dir/
 cp $rust_target_dir/enclaver-run $docker_build_dir/
+
+docker buildx build \
+	-f ../build/dockerfiles/cli-dev.dockerfile \
+	-t ${cli_tag} \
+	${docker_build_dir}
 
 docker buildx build \
 	-f ../build/dockerfiles/odyn-dev.dockerfile \
@@ -42,6 +49,7 @@ docker buildx build \
 	-t ${wrapper_base_tag} \
 	${docker_build_dir}
 
+echo "The enclaver CLI dev image is: \"${cli_tag}\""
 echo "To use dev images, merge the following into enclaver.yaml:"
 echo ""
 echo "sources:"
