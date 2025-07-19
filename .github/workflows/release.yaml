@@ -150,10 +150,9 @@ jobs:
       - name: Sign Odyn Image
         run: >-
           cosign sign --yes --identity-token "$COSIGN_OIDC_TOKEN"
-          "public.ecr.aws/f5z1z8p0/odyn@$DIGEST"
+          "public.ecr.aws/f5z1z8p0/odyn@${{ steps.odyn-image.outputs.digest }}"
         env:
           COSIGN_OIDC_TOKEN: ${{ steps.cosign-token.outputs.token }}
-          DIGEST: ${{ steps.odyn-image.outputs.digest }}
 
       - name: Generate Runtime Base Image Metadata
         id: wrapper-base-metadata
@@ -180,10 +179,9 @@ jobs:
       - name: Sign Runtime Base Image
         run: >-
           cosign sign --yes --identity-token "$COSIGN_OIDC_TOKEN"
-          "public.ecr.aws/f5z1z8p0/enclaver-wrapper-base@$DIGEST"
+          "public.ecr.aws/f5z1z8p0/enclaver-wrapper-base@${{ steps.wrapper-base-image.outputs.digest }}"
         env:
           COSIGN_OIDC_TOKEN: ${{ steps.cosign-token.outputs.token }}
-          DIGEST: ${{ steps.wrapper-base-image.outputs.digest }}
 
       - name: Generate CLI Image Metadata
         id: cli-metadata
@@ -210,10 +208,9 @@ jobs:
       - name: Sign CLI Image
         run: >-
           cosign sign --yes --identity-token "$COSIGN_OIDC_TOKEN"
-          "public.ecr.aws/f5z1z8p0/enclaver@$DIGEST"
+          "public.ecr.aws/f5z1z8p0/enclaver@${{ steps.cli-image.outputs.digest }}"
         env:
           COSIGN_OIDC_TOKEN: ${{ steps.cosign-token.outputs.token }}
-          DIGEST: ${{ steps.cli-image.outputs.digest }}
 
   upload-release-artifact:
     if: github.repository == 'EternisAI/enclaver' && github.ref_type == 'tag'
