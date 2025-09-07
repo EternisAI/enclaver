@@ -325,7 +325,11 @@ impl KmsProxyHandler {
         })
     }
 
-    async fn handle_response(&self, method: &str, resp: Response<Full<Bytes>>) -> Result<Response<Full<Bytes>>> {
+    async fn handle_response(
+        &self,
+        method: &str,
+        resp: Response<Full<Bytes>>,
+    ) -> Result<Response<Full<Bytes>>> {
         let (mut head, body) = resp.into_parts();
         head.headers.remove(hyper::header::CONTENT_LENGTH);
 
