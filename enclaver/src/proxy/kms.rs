@@ -304,13 +304,17 @@ impl KmsProxyHandler {
             },
         )?;
 
-        let req_out = KmsRequestOutgoing::new(authority, req_in.target().unwrap(), body_obj)?;
+        // safe to unwrap b/c otherwise we wouldn't know it's an attesting action
+        let target = req_in.target().unwrap();
+
+        let req_out = KmsRequestOutgoing::new(authority, target, body_obj)?;
 
         // Send the request to the actual KMS
         let resp = self.send(req_out, &region).await?;
 
         // Decode the response
-        self.handle_response(resp).await
+        // safe to unwrap b/c otherwise we wouldn't know it's an attesting action
+        self.handle_response(target.to_str().unwrap(), resp).await
     }
 
     fn get_attestation(&self) -> Result<Vec<u8>> {
@@ -321,7 +325,7 @@ impl KmsProxyHandler {
         })
     }
 
-    async fn handle_response(&self, resp: Response<Full<Bytes>>) -> Result<Response<Full<Bytes>>> {
+    async fn handle_response(&self, method: &str, resp: Response<Full<Bytes>>) -> Result<Response<Full<Bytes>>> {
         let (mut head, body) = resp.into_parts();
         head.headers.remove(hyper::header::CONTENT_LENGTH);
 
@@ -346,7 +350,13 @@ impl KmsProxyHandler {
             let ciphertext = base64::decode(b64ciphertext)?;
             let plaintext = self.decrypt_cms(&ciphertext)?;
 
-            body_obj["Plaintext"] = json::JsonValue::String(base64::encode(plaintext));
+            let field_name = match method {
+                "TrentService.GenerateDataKeyPair" => "PrivateKeyPlaintext",
+                "TrentService.DeriveSharedSecret" => "SharedSecret",
+                _ => "Plaintext",
+            };
+
+            body_obj[field_name] = json::JsonValue::String(base64::encode(plaintext));
             Ok(json_response(head, JsonValue::Object(body_obj)))
         } else {
             Err(anyhow!("The response body is not a JSON object"))
