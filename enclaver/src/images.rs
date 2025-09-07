@@ -1,10 +1,12 @@
 use crate::utils::StringablePathExt;
 use anyhow::{anyhow, Context, Result};
+use bollard::auth::DockerCredentials;
 use bollard::image::{BuildImageOptions, CreateImageOptions, TagImageOptions};
 use bollard::models::{BuildInfo, CreateImageInfo, ImageId};
 use bollard::Docker;
 use futures_util::stream::{StreamExt, TryStreamExt};
 use log::{debug, trace};
+use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write;
 use std::path::PathBuf;
@@ -33,6 +35,7 @@ impl fmt::Display for ImageRef {
 /// An interface for manipulating Docker images.
 pub struct ImageManager {
     docker: Arc<Docker>,
+    credentials: Arc<HashMap<String, DockerCredentials>>,
 }
 
 impl ImageManager {
@@ -44,14 +47,67 @@ impl ImageManager {
                 .map_err(|e| anyhow!("connecting to docker: {}", e))?,
         );
 
+        let docker_credentials = Arc::new(
+            ImageManager::load_docker_credentials().context("loading docker credentials")?,
+        );
+
         Ok(Self {
             docker: docker_client,
+            credentials: docker_credentials,
         })
     }
 
     /// Constructs a new ImageManager pointing to a local Docker daemon.
-    pub fn new_with_docker(docker: Arc<Docker>) -> Result<Self> {
-        Ok(Self { docker })
+    pub fn new_with_docker(docker_client: Arc<Docker>) -> Result<Self> {
+        let docker_credentials = Arc::new(
+            ImageManager::load_docker_credentials().context("loading docker credentials")?,
+        );
+
+        Ok(Self {
+            docker: docker_client,
+            credentials: docker_credentials,
+        })
+    }
+
+    /// TODO
+    fn load_docker_credentials() -> Result<HashMap<String, DockerCredentials>> {
+        let mut credentials = HashMap::new();
+
+        let config_dir = match std::env::var("DOCKER_CONFIG") {
+            Ok(env_dir) => PathBuf::from(env_dir),
+            _ => match std::env::home_dir() {
+                Some(home_dir) => home_dir,
+                None => return Err(anyhow!("cannot determine home directory")),
+            },
+        };
+
+        let config_path = config_dir.join(".docker").join("config.json");
+        let config_str =
+            std::fs::read_to_string(&config_path).context("cannot read docker config file")?;
+        let config: serde_json::Value =
+            serde_json::from_str(&config_str).context("cannot parse docker config file")?;
+
+        if let Some(auths) = config.get("auths").and_then(|v| v.as_object()) {
+            for (registry, creds) in auths {
+                if let Some(auth) = creds.get("auth").and_then(|v| v.as_str()) {
+                    if let Ok(decoded) = base64::decode(auth) {
+                        if let Ok(decoded_str) = String::from_utf8(decoded) {
+                            let parts: Vec<&str> = decoded_str.splitn(2, ':').collect();
+                            if parts.len() == 2 {
+                                let docker_creds = DockerCredentials {
+                                    username: Some(parts[0].to_string()),
+                                    password: Some(parts[1].to_string()),
+                                    ..Default::default()
+                                };
+                                credentials.insert(registry.clone(), docker_creds);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(credentials)
     }
 
     /// Resolves a name-like string to an ImageRef referencing a specific immutable image.
@@ -106,7 +162,7 @@ impl ImageManager {
                 ..Default::default()
             }),
             None,
-            None,
+            self.get_credentials(image_name),
         );
 
         while let Some(item) = fetch_stream.next().await {
@@ -122,6 +178,22 @@ impl ImageManager {
         }
 
         self.image(image_name).await
+    }
+
+    /// TODO
+    fn get_credentials(&self, image_name: &str) -> Option<DockerCredentials> {
+        let parts: Vec<&str> = image_name.splitn(2, '/').collect();
+
+        let registry = if parts.len() > 1
+            && (parts[0].contains('.') || parts[0].contains(':') || parts[0] == "localhost")
+            && (parts[0] != "docker.io")
+        {
+            parts[0]
+        } else {
+            "https://index.docker.io/v1/"
+        };
+
+        self.credentials.get(registry).cloned()
     }
 
     /// Build and append a new layer to an image.
