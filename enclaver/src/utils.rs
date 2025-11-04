@@ -7,7 +7,7 @@ use tokio::io::AsyncRead;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
-const LOG_LINE_MAX_LEN: usize = 4 * 1024;
+const LOG_LINE_MAX_LEN: usize = 16 * 1024;
 
 #[cfg(feature = "tracing")]
 #[macro_export]
