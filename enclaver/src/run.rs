@@ -274,7 +274,10 @@ impl Enclave {
         let mut watcher = files::DirectoryGroupWatcher::new(&groups)?;
         let (group_tx, mut group_rx) = mpsc::unbounded_channel::<files::DirectoryGroup>();
 
-        info!("starting file sync watcher for {} directory groups", total_groups);
+        info!(
+            "starting file sync watcher for {} directory groups",
+            total_groups
+        );
         self.tasks
             .push(utils::spawn!("file sync watcher", async move {
                 watcher.run(group_tx).await;

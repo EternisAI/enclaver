@@ -71,10 +71,12 @@ pub fn group_files_by_directory(manifest_files: &[String]) -> HashMap<String, Di
             }
         };
 
-        let group = groups.entry(parent.clone()).or_insert_with(|| DirectoryGroup {
-            directory: parent,
-            files: HashMap::new(),
-        });
+        let group = groups
+            .entry(parent.clone())
+            .or_insert_with(|| DirectoryGroup {
+                directory: parent,
+                files: HashMap::new(),
+            });
         group.files.insert(file_path.clone(), filename);
     }
 
@@ -193,11 +195,7 @@ impl DirectoryGroupWatcher {
         }
     }
 
-    fn handle_event(
-        &self,
-        event: &DebouncedEvent,
-        sender: &mpsc::UnboundedSender<DirectoryGroup>,
-    ) {
+    fn handle_event(&self, event: &DebouncedEvent, sender: &mpsc::UnboundedSender<DirectoryGroup>) {
         let dominated = matches!(
             event.kind,
             notify::event::EventKind::Create(_)
@@ -296,10 +294,9 @@ pub async fn sync_directory_group(conn: &mut VsockStream, group: &DirectoryGroup
 
     // Phase 3: send file contents in order
     for (i, entry) in entries.iter().enumerate() {
-        let mut file = File::open(&file_paths[i]).await.context(format!(
-            "opening file {} for sync",
-            entry.manifest_path
-        ))?;
+        let mut file = File::open(&file_paths[i])
+            .await
+            .context(format!("opening file {} for sync", entry.manifest_path))?;
 
         let mut buffer = [0u8; SYNC_IO_BUFFER_SIZE];
         let mut bytes_remaining = entry.size;

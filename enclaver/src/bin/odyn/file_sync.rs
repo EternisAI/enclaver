@@ -57,12 +57,9 @@ impl FileSyncServer {
 
             info!("File sync: host connected");
 
-            if let Err(err) = Self::handle_connection(
-                &mut self.initial_sync_notifier,
-                &mut self.dir_state,
-                conn,
-            )
-            .await
+            if let Err(err) =
+                Self::handle_connection(&mut self.initial_sync_notifier, &mut self.dir_state, conn)
+                    .await
             {
                 warn!("File sync: connection ended: {err}");
                 // On disconnect, accept a new connection (host will re-send all groups)
@@ -81,8 +78,8 @@ impl FileSyncServer {
 
             match msg {
                 SyncMessage::ChangesetBegin { directory, files } => {
-                    let result = Self::handle_changeset(dir_state, &mut conn, &directory, &files)
-                        .await;
+                    let result =
+                        Self::handle_changeset(dir_state, &mut conn, &directory, &files).await;
 
                     let ack = match result {
                         Ok(()) => SyncMessage::ChangesetAck {
@@ -126,10 +123,9 @@ impl FileSyncServer {
         let dir_path = Path::new(directory);
 
         // Step 1: Ensure target directory exists
-        fs::create_dir_all(dir_path).await.context(format!(
-            "creating target directory {}",
-            directory
-        ))?;
+        fs::create_dir_all(dir_path)
+            .await
+            .context(format!("creating target directory {}", directory))?;
 
         // Step 2: Create timestamped directory
         let now = chrono::Utc::now();
@@ -258,21 +254,19 @@ impl FileSyncServer {
             let tmp_path = ts_dir_path.join(format!(".tmp.{}", &entry.name));
 
             {
-                let mut file = fs::File::create(&tmp_path).await.context(format!(
-                    "creating temp file for {}",
-                    entry.name
-                ))?;
+                let mut file = fs::File::create(&tmp_path)
+                    .await
+                    .context(format!("creating temp file for {}", entry.name))?;
 
                 if entry.size > 0 {
                     let mut buffer = [0u8; files::SYNC_IO_BUFFER_SIZE];
                     let mut remaining = entry.size;
 
                     while remaining > 0 {
-                        let to_read =
-                            std::cmp::min(remaining as usize, files::SYNC_IO_BUFFER_SIZE);
-                        conn.read_exact(&mut buffer[..to_read]).await.context(
-                            format!("reading file content for {}", entry.name),
-                        )?;
+                        let to_read = std::cmp::min(remaining as usize, files::SYNC_IO_BUFFER_SIZE);
+                        conn.read_exact(&mut buffer[..to_read])
+                            .await
+                            .context(format!("reading file content for {}", entry.name))?;
                         file.write_all(&buffer[..to_read]).await?;
                         remaining -= to_read as u64;
                     }
@@ -281,10 +275,9 @@ impl FileSyncServer {
                 file.flush().await?;
             }
 
-            fs::rename(&tmp_path, &file_path).await.context(format!(
-                "renaming temp file to {}",
-                file_path.display()
-            ))?;
+            fs::rename(&tmp_path, &file_path)
+                .await
+                .context(format!("renaming temp file to {}", file_path.display()))?;
         }
 
         Ok(())
