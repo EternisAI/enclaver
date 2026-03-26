@@ -260,43 +260,66 @@ impl Enclave {
     }
 
     fn start_file_sync(&mut self, cid: u32) -> Result<()> {
-        let mut files = HashSet::new();
-
-        if let Some(ref manifest_files) = self.manifest.files {
-            for file_path in manifest_files {
-                files.insert(file_path.clone());
+        let manifest_files = match self.manifest.files {
+            Some(ref f) if !f.is_empty() => f.clone(),
+            _ => {
+                info!("no files defined, no file sync client will be started");
+                return Ok(());
             }
-        }
+        };
 
-        if files.is_empty() {
-            info!("no files defined, no file sync client will be started");
-            return Ok(());
-        }
+        let groups = files::group_files_by_directory(&manifest_files);
+        let total_groups = groups.len();
 
-        let mut watcher = files::Watcher::new(&files)?;
-        let (sync_tx, mut sync_rx) = mpsc::unbounded_channel::<files::Watch>();
+        let mut watcher = files::DirectoryGroupWatcher::new(&groups)?;
+        let (group_tx, mut group_rx) = mpsc::unbounded_channel::<files::DirectoryGroup>();
 
-        info!("starting file sync watcher");
+        info!("starting file sync watcher for {} directory groups", total_groups);
         self.tasks
             .push(utils::spawn!("file sync watcher", async move {
-                watcher.run(sync_tx).await;
+                watcher.run(group_tx).await;
             })?);
 
         info!("starting file sync client");
         self.tasks
             .push(utils::spawn!("file sync client", async move {
                 info!("waiting for enclave to boot to sync files");
-                loop {
+                let mut conn = loop {
                     match VsockStream::connect(cid, FILE_SYNC_PORT).await {
-                        Ok(_) => break,
-                        // TODO: improve the polling frequency / backoff / timeout
+                        Ok(conn) => break conn,
                         Err(_) => tokio::time::sleep(FILE_VSOCK_RETRY_INTERVAL).await,
                     }
-                }
+                };
+                info!("connected to enclave for file sync");
 
-                while let Some(ref watch) = sync_rx.recv().await {
-                    if let Err(err) = files::sync_watched_file(cid, watch).await {
-                        error!("file sync error for {}: {}", watch, err);
+                let mut synced_groups = HashSet::new();
+                let mut initial_sync_done = false;
+
+                while let Some(ref group) = group_rx.recv().await {
+                    if let Err(err) = files::sync_directory_group(&mut conn, group).await {
+                        error!("file sync error for {}: {}", group.directory, err);
+                        // On connection error, reconnect and re-sync everything
+                        info!("file sync: reconnecting to enclave");
+                        conn = loop {
+                            match VsockStream::connect(cid, FILE_SYNC_PORT).await {
+                                Ok(conn) => break conn,
+                                Err(_) => tokio::time::sleep(FILE_VSOCK_RETRY_INTERVAL).await,
+                            }
+                        };
+                        synced_groups.clear();
+                        initial_sync_done = false;
+                        continue;
+                    }
+
+                    if !initial_sync_done {
+                        synced_groups.insert(group.directory.clone());
+                        if synced_groups.len() >= total_groups {
+                            if let Err(err) = files::send_initial_sync_complete(&mut conn).await {
+                                error!("file sync: error sending initial sync complete: {}", err);
+                            } else {
+                                initial_sync_done = true;
+                            }
+                        }
                     }
                 }
             })?);

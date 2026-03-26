@@ -1,166 +1,293 @@
 use anyhow::{anyhow, Context, Result};
 use futures::{Stream, StreamExt};
-use log::{error, info};
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use log::{error, info, warn};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tokio_util::codec::{BytesCodec, FramedRead};
 use tokio_vsock::VsockStream;
 
 use crate::config::Configuration;
 use enclaver::constants::FILE_SYNC_PORT;
-use enclaver::files;
+use enclaver::files::{self, FileEntry, SyncMessage};
 use enclaver::json_transport::JsonTransport;
 use enclaver::vsock;
 
+struct DirectoryState {
+    /// Name of the current timestamped directory (just the dir name, not full path)
+    current_ts_dir: Option<String>,
+    /// Whether per-file symlinks have been created for this directory
+    symlinks_created: bool,
+}
+
 struct FileSyncServer {
-    files: Arc<HashMap<String, PathBuf>>,
     incoming: Box<dyn Stream<Item = VsockStream> + Unpin + Send>,
-    initial_sync_done: Arc<AtomicBool>,
-    initial_sync_notifier: oneshot::Sender<()>,
+    initial_sync_notifier: Option<oneshot::Sender<()>>,
+    dir_state: HashMap<String, DirectoryState>,
 }
 
 impl FileSyncServer {
-    pub fn new(sender: oneshot::Sender<()>, files: &HashSet<String>) -> Result<Self> {
+    pub fn new(sender: oneshot::Sender<()>) -> Result<Self> {
         let incoming = Box::new(vsock::serve(FILE_SYNC_PORT)?);
 
         Ok(Self {
-            files: Arc::new(
-                files
-                    .iter()
-                    .map(|file| (file.clone(), PathBuf::from(file)))
-                    .collect::<HashMap<_, _>>(),
-            ),
             incoming,
-            initial_sync_done: Arc::new(AtomicBool::new(false)),
-            initial_sync_notifier: sender,
+            initial_sync_notifier: Some(sender),
+            dir_state: HashMap::new(),
         })
     }
 
-    pub async fn serve(self) -> Result<()> {
-        for path in self.files.values() {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).await.context(format!(
-                    "cannot create parent directory for {}",
-                    path.to_string_lossy()
-                ))?;
-            } else {
+    pub async fn serve(mut self) -> Result<()> {
+        info!("Waiting for the host to connect for file sync");
+
+        let mut incoming = Box::into_pin(self.incoming);
+
+        // Take the stream out so we can borrow self mutably in the loop
+        loop {
+            // Accept a connection
+            let conn = loop {
+                match incoming.next().await {
+                    Some(stream) => break stream,
+                    None => continue,
+                }
+            };
+
+            info!("File sync: host connected");
+
+            if let Err(err) = Self::handle_connection(
+                &mut self.initial_sync_notifier,
+                &mut self.dir_state,
+                conn,
+            )
+            .await
+            {
+                warn!("File sync: connection ended: {err}");
+                // On disconnect, accept a new connection (host will re-send all groups)
+                info!("File sync: waiting for host to reconnect");
+            }
+        }
+    }
+
+    async fn handle_connection(
+        initial_sync_notifier: &mut Option<oneshot::Sender<()>>,
+        dir_state: &mut HashMap<String, DirectoryState>,
+        mut conn: VsockStream,
+    ) -> Result<()> {
+        loop {
+            let msg: SyncMessage = SyncMessage::recv(&mut conn).await?;
+
+            match msg {
+                SyncMessage::ChangesetBegin { directory, files } => {
+                    let result = Self::handle_changeset(dir_state, &mut conn, &directory, &files)
+                        .await;
+
+                    let ack = match result {
+                        Ok(()) => SyncMessage::ChangesetAck {
+                            directory: directory.clone(),
+                            success: true,
+                            error: None,
+                        },
+                        Err(ref err) => {
+                            error!("File sync: changeset for {} failed: {}", directory, err);
+                            SyncMessage::ChangesetAck {
+                                directory: directory.clone(),
+                                success: false,
+                                error: Some(format!("{err}")),
+                            }
+                        }
+                    };
+
+                    SyncMessage::send(&ack, &mut conn).await?;
+                }
+                SyncMessage::InitialSyncComplete => {
+                    info!("File sync: initial sync complete");
+                    SyncMessage::send(&SyncMessage::InitialSyncAck, &mut conn).await?;
+
+                    if let Some(notifier) = initial_sync_notifier.take() {
+                        let _ = notifier.send(());
+                    }
+                }
+                other => {
+                    warn!("File sync: unexpected message: {:?}", other);
+                }
+            }
+        }
+    }
+
+    async fn handle_changeset(
+        dir_state: &mut HashMap<String, DirectoryState>,
+        conn: &mut VsockStream,
+        directory: &str,
+        file_entries: &[FileEntry],
+    ) -> Result<()> {
+        let dir_path = Path::new(directory);
+
+        // Step 1: Ensure target directory exists
+        fs::create_dir_all(dir_path).await.context(format!(
+            "creating target directory {}",
+            directory
+        ))?;
+
+        // Step 2: Create timestamped directory
+        let now = chrono::Utc::now();
+        let ts_dir_name = format!("..{}", now.format("%Y_%m_%d_%H_%M_%S%.6f"));
+        let ts_dir_path = dir_path.join(&ts_dir_name);
+
+        fs::create_dir_all(&ts_dir_path).await.context(format!(
+            "creating timestamped directory {}",
+            ts_dir_path.display()
+        ))?;
+
+        info!(
+            "File sync: receiving changeset for {} -> {} ({} files)",
+            directory,
+            ts_dir_name,
+            file_entries.len()
+        );
+
+        // Step 3: Receive and write files into timestamped directory
+        let write_result = Self::receive_files(conn, &ts_dir_path, file_entries).await;
+
+        if let Err(err) = &write_result {
+            // Cleanup incomplete timestamped directory on error
+            error!(
+                "File sync: error receiving files for {}, cleaning up: {}",
+                directory, err
+            );
+            let _ = fs::remove_dir_all(&ts_dir_path).await;
+            // Still need to read ChangesetEnd to keep protocol in sync
+            let _end: SyncMessage = SyncMessage::recv(conn).await?;
+            return write_result;
+        }
+
+        // Step 4: Read ChangesetEnd and verify
+        let end_msg: SyncMessage = SyncMessage::recv(conn).await?;
+        match end_msg {
+            SyncMessage::ChangesetEnd { directory: ref d } if d == directory => {}
+            _ => {
+                let _ = fs::remove_dir_all(&ts_dir_path).await;
                 return Err(anyhow!(
-                    "cannot find parent directory for {}",
-                    path.to_string_lossy()
+                    "expected ChangesetEnd for {}, got {:?}",
+                    directory,
+                    end_msg
                 ));
             }
         }
 
-        info!("Waiting for the host to connect for file sync");
+        // Step 5: Create ..data_tmp symlink pointing to the timestamped directory
+        let data_tmp_path = dir_path.join("..data_tmp");
 
-        let mut incoming = Box::into_pin(self.incoming);
-        loop {
-            let initial_conn = incoming.next().await;
-            if initial_conn.is_some() {
-                break;
+        // Remove stale ..data_tmp if it exists
+        let _ = fs::remove_file(&data_tmp_path).await;
+
+        tokio::fs::symlink(&ts_dir_name, &data_tmp_path)
+            .await
+            .context("creating ..data_tmp symlink")?;
+
+        // Step 6: Atomic rename ..data_tmp -> ..data
+        let data_path = dir_path.join("..data");
+        fs::rename(&data_tmp_path, &data_path)
+            .await
+            .context("atomic rename ..data_tmp to ..data")?;
+
+        // Step 7: Create per-file symlinks (first sync only for this directory)
+        let state = dir_state
+            .entry(directory.to_string())
+            .or_insert_with(|| DirectoryState {
+                current_ts_dir: None,
+                symlinks_created: false,
+            });
+
+        if !state.symlinks_created {
+            for entry in file_entries {
+                let symlink_path = dir_path.join(&entry.name);
+                let symlink_target = PathBuf::from("..data").join(&entry.name);
+
+                // Remove any existing file/symlink at this path
+                let _ = fs::remove_file(&symlink_path).await;
+
+                tokio::fs::symlink(&symlink_target, &symlink_path)
+                    .await
+                    .context(format!(
+                        "creating file symlink {} -> {}",
+                        symlink_path.display(),
+                        symlink_target.display()
+                    ))?;
+
+                info!(
+                    "File sync: created symlink {} -> {}",
+                    symlink_path.display(),
+                    symlink_target.display()
+                );
+            }
+            state.symlinks_created = true;
+        }
+
+        // Step 8: Cleanup old timestamped directory
+        if let Some(ref old_ts_dir) = state.current_ts_dir {
+            let old_path = dir_path.join(old_ts_dir);
+            if let Err(err) = fs::remove_dir_all(&old_path).await {
+                warn!(
+                    "File sync: failed to clean up old directory {}: {}",
+                    old_path.display(),
+                    err
+                );
             }
         }
 
-        info!("Accepting file sync connections");
+        // Step 9: Update state
+        state.current_ts_dir = Some(ts_dir_name.clone());
 
-        let (event_tx, mut event_rx) = mpsc::channel(self.files.len());
-        let mut initial_sync_files = self.files.keys().cloned().collect::<HashSet<_>>();
-        let initial_sync_done = self.initial_sync_done.clone();
-
-        let server = tokio::task::spawn(async move {
-            while let Some(stream) = incoming.next().await {
-                let initial_sync_done = initial_sync_done.clone();
-                let files = self.files.clone();
-                let tx = event_tx.clone();
-                tokio::task::spawn(async move {
-                    match FileSyncServer::service_conn(stream, files).await {
-                        Ok(file) => {
-                            if !initial_sync_done.load(Ordering::SeqCst) {
-                                let _ = tx.send(file).await;
-                            }
-                        }
-                        Err(err) => error!("{err}"),
-                    }
-                });
-            }
-        });
-
-        let initial_sync_done = self.initial_sync_done.clone();
-
-        while !initial_sync_done.load(Ordering::SeqCst) {
-            if let Some(file) = event_rx.recv().await {
-                initial_sync_files.remove(&file);
-                if initial_sync_files.is_empty() {
-                    initial_sync_done.store(true, Ordering::SeqCst);
-                    break;
-                }
-            }
-        }
-
-        let _ = self.initial_sync_notifier.send(());
-        server.await?;
+        info!("File sync: changeset for {} complete", directory);
 
         Ok(())
     }
 
-    async fn service_conn(
-        mut vsock: VsockStream,
-        files: Arc<HashMap<String, PathBuf>>,
-    ) -> Result<String> {
-        let file_meta = files::Metadata::recv(&mut vsock).await?;
+    async fn receive_files(
+        conn: &mut VsockStream,
+        ts_dir_path: &Path,
+        file_entries: &[FileEntry],
+    ) -> Result<()> {
+        for entry in file_entries {
+            let file_path = ts_dir_path.join(&entry.name);
 
-        if let Some(file) = files.get(&file_meta.path) {
-            info!(
-                "Syncing file: {} ({} bytes)",
-                file_meta.path, file_meta.size
-            );
-
-            let now = chrono::Utc::now();
-            let ts = now.timestamp_millis().to_string();
-
-            let mut tmp_file = file.as_os_str().to_os_string();
-            tmp_file.push(std::ffi::OsString::from(".".to_string() + &ts));
+            // Write to a temp file first, then rename for crash safety
+            let tmp_path = ts_dir_path.join(format!(".tmp.{}", &entry.name));
 
             {
-                let mut file = fs::File::create(&tmp_file).await?;
+                let mut file = fs::File::create(&tmp_path).await.context(format!(
+                    "creating temp file for {}",
+                    entry.name
+                ))?;
 
-                if file_meta.size > 0 {
-                    let mut reader = FramedRead::new(vsock, BytesCodec::new());
-                    let mut bytes_written: u64 = 0;
+                if entry.size > 0 {
+                    let mut buffer = [0u8; files::SYNC_IO_BUFFER_SIZE];
+                    let mut remaining = entry.size;
 
-                    while let Some(Ok(chunk)) = reader.next().await {
-                        let bytes_pending = if bytes_written + chunk.len() as u64 > file_meta.size {
-                            bytes_written + chunk.len() as u64 - file_meta.size
-                        } else {
-                            chunk.len() as u64
-                        };
-
-                        file.write_all(&chunk[..bytes_pending as usize]).await?;
-                        bytes_written += bytes_pending;
+                    while remaining > 0 {
+                        let to_read =
+                            std::cmp::min(remaining as usize, files::SYNC_IO_BUFFER_SIZE);
+                        conn.read_exact(&mut buffer[..to_read]).await.context(
+                            format!("reading file content for {}", entry.name),
+                        )?;
+                        file.write_all(&buffer[..to_read]).await?;
+                        remaining -= to_read as u64;
                     }
-
-                    file.flush().await?;
                 }
+
+                file.flush().await?;
             }
 
-            fs::rename(&tmp_file, &file).await?;
-
-            info!("File sync done: {}", file_meta.path);
-        } else {
-            return Err(anyhow!(
-                "received sync request for unknown file {}",
-                file_meta.path
-            ));
+            fs::rename(&tmp_path, &file_path).await.context(format!(
+                "renaming temp file to {}",
+                file_path.display()
+            ))?;
         }
 
-        Ok(file_meta.path)
+        Ok(())
     }
 }
 
@@ -170,25 +297,23 @@ pub struct FileSyncService {
 
 impl FileSyncService {
     pub async fn start(config: &Configuration) -> Result<Self> {
-        let mut files = HashSet::new();
+        let has_files = config
+            .manifest
+            .files
+            .as_ref()
+            .map_or(false, |f| !f.is_empty());
 
-        if let Some(ref manifest_files) = config.manifest.files {
-            for file_path in manifest_files {
-                files.insert(file_path.clone());
-            }
-        }
-
-        let task = if files.is_empty() {
+        let task = if !has_files {
             None
         } else {
             info!("Starting file sync server");
 
             let (sync_tx, sync_rx) = oneshot::channel();
-            let server = FileSyncServer::new(sync_tx, &files)?;
+            let server = FileSyncServer::new(sync_tx)?;
 
             let handle = tokio::task::spawn(async move {
                 if let Err(err) = server.serve().await {
-                    error!("{err}");
+                    error!("File sync server error: {err}");
                 }
             });
 

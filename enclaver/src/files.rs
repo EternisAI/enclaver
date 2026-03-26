@@ -1,84 +1,107 @@
-use anyhow::{anyhow, Context, Result};
-use bytes::Bytes;
-use futures_util::SinkExt;
+use anyhow::{Context, Result};
 use log::{error, info, warn};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt;
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::Path;
 
 use notify_debouncer_full::{
     new_debouncer, notify, DebounceEventResult, DebouncedEvent, Debouncer, RecommendedCache,
 };
 use serde::{Deserialize, Serialize};
 use tokio::fs::File;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
-use tokio_util::codec::{BytesCodec, FramedWrite};
 use tokio_vsock::VsockStream;
 
-use crate::constants::FILE_SYNC_PORT;
 use crate::json_transport::JsonTransport;
 
-pub const INOTIFY_EVENT_DEBOUNCE_INTERVAL: Duration = Duration::from_secs(1);
+pub const DIRECTORY_WATCH_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(500);
 pub const SYNC_IO_BUFFER_SIZE: usize = 65536;
 
-#[derive(Serialize, Deserialize)]
-pub struct Metadata {
-    pub path: String,
+// --- Wire protocol types ---
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
+pub enum SyncMessage {
+    ChangesetBegin {
+        directory: String,
+        files: Vec<FileEntry>,
+    },
+    ChangesetEnd {
+        directory: String,
+    },
+    ChangesetAck {
+        directory: String,
+        success: bool,
+        error: Option<String>,
+    },
+    InitialSyncComplete,
+    InitialSyncAck,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileEntry {
+    pub name: String,
+    pub manifest_path: String,
     pub size: u64,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum WatchKind {
-    Regular,
-    Symlink,
+// --- Directory grouping ---
+
+#[derive(Clone, Debug)]
+pub struct DirectoryGroup {
+    pub directory: String,
+    pub files: HashMap<String, String>, // manifest_path -> filename
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Watch {
-    pub kind: WatchKind,
-    pub file: String,
-    pub path: PathBuf,
-}
+pub fn group_files_by_directory(manifest_files: &[String]) -> HashMap<String, DirectoryGroup> {
+    let mut groups: HashMap<String, DirectoryGroup> = HashMap::new();
 
-impl fmt::Display for Watch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let path_str = self.path.to_string_lossy().to_string();
-        if matches!(self.kind, WatchKind::Regular) && self.file == path_str {
-            write!(f, "{path_str}")
-        } else {
-            write!(f, "{} -> {path_str}", self.file)
-        }
+    for file_path in manifest_files {
+        let path = Path::new(file_path);
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_string_lossy().to_string(),
+            _ => "/".to_string(),
+        };
+        let filename = match path.file_name() {
+            Some(name) => name.to_string_lossy().to_string(),
+            None => {
+                warn!("file path to sync has no filename component: {}", file_path);
+                continue;
+            }
+        };
+
+        let group = groups.entry(parent.clone()).or_insert_with(|| DirectoryGroup {
+            directory: parent,
+            files: HashMap::new(),
+        });
+        group.files.insert(file_path.clone(), filename);
     }
+
+    groups
 }
 
-pub struct Watcher {
+// --- Directory group watcher ---
+
+pub struct DirectoryGroupWatcher {
     debouncer: Debouncer<notify::RecommendedWatcher, RecommendedCache>,
     receiver: mpsc::UnboundedReceiver<DebouncedEvent>,
-
-    notifications: VecDeque<Watch>,
-
-    watched_directories: HashMap<PathBuf, HashSet<PathBuf>>,
-    watched_paths: HashMap<String, HashSet<Watch>>,
-    watches: HashMap<PathBuf, Watch>,
-
-    files_to_add: Vec<String>,
-    files_to_remove: Vec<String>,
+    /// Maps canonical watched directory path -> DirectoryGroup
+    dir_to_group: HashMap<String, DirectoryGroup>,
 }
 
-impl Watcher {
-    pub fn new(files: &HashSet<String>) -> Result<Self> {
+impl DirectoryGroupWatcher {
+    pub fn new(groups: &HashMap<String, DirectoryGroup>) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         let debouncer = new_debouncer(
-            INOTIFY_EVENT_DEBOUNCE_INTERVAL,
+            DIRECTORY_WATCH_DEBOUNCE_INTERVAL,
             None,
             move |result: DebounceEventResult| match result {
                 Ok(events) => {
                     for event in events {
                         if let Err(err) = event_tx.send(event) {
-                            error!("file sync watcher error sending event notification: {err}");
+                            error!("file sync watcher error sending event: {err}");
                         }
                     }
                 }
@@ -89,309 +112,258 @@ impl Watcher {
                 }
             },
         )
-        .context("setting file sync watcher inotify event debouncer")?;
+        .context("creating file sync directory watcher")?;
 
-        Ok(Self {
+        let mut watcher = Self {
             debouncer,
             receiver: event_rx,
+            dir_to_group: HashMap::with_capacity(groups.len()),
+        };
 
-            notifications: VecDeque::new(),
-
-            watched_directories: HashMap::with_capacity(files.len()),
-            watched_paths: HashMap::with_capacity(files.len()),
-            watches: HashMap::with_capacity(files.len()),
-
-            files_to_add: files.iter().cloned().collect::<Vec<_>>(),
-            files_to_remove: Vec::with_capacity(files.len()),
-        })
-    }
-
-    pub async fn run(&mut self, sender: mpsc::UnboundedSender<Watch>) {
-        'run: loop {
-            let mut files_to_remove = self.files_to_remove.drain(..).collect::<HashSet<_>>();
-            for file in files_to_remove.drain() {
-                self.unwatch(&file);
-            }
-
-            let mut files_to_add = self.files_to_add.drain(..).collect::<HashSet<_>>();
-            for file in files_to_add.drain() {
-                self.watch(&file);
-            }
-
-            self.cleanup_watches();
-
-            while let Some(watch) = self.notifications.pop_front() {
-                if let Err(err) = sender.send(watch.clone()) {
-                    error!(
-                        "file sync watcher error notifying about watch event for {}: {}",
-                        watch, err,
-                    );
-                }
-            }
-
-            loop {
-                tokio::select! {
-                    event = self.receiver.recv() => match event {
-                        Some(ref event) => {
-                            for path in event.paths.iter() {
-                                self.handle_event(path, event);
-                            }
-                        }
-                        None => {
-                            error!("file sync watcher event notification channel closed");
-                            break 'run;
-                        }
-                    },
-                    _ = sleep(INOTIFY_EVENT_DEBOUNCE_INTERVAL) => continue 'run,
-                }
+        for group in groups.values() {
+            if let Err(err) = watcher.watch_directory(group) {
+                error!(
+                    "file sync watcher: failed to watch directory {}: {}",
+                    group.directory, err
+                );
             }
         }
+
+        Ok(watcher)
     }
 
-    fn watch(&mut self, file: &String) {
-        let path = PathBuf::from(file);
+    fn watch_directory(&mut self, group: &DirectoryGroup) -> Result<()> {
+        let dir_path = Path::new(&group.directory);
 
-        if path.is_symlink() {
-            let mut paths = VecDeque::new();
-            paths.push_back(path);
-
-            while let Some(path) = paths.pop_front() {
-                if path.is_symlink() {
-                    if self.add_watch(WatchKind::Symlink, file, &path).is_err() {
-                        return;
-                    }
-
-                    let mut link_target = match path.parent() {
-                        Some(parent) => parent.to_path_buf(),
-                        None => PathBuf::from("/"),
-                    };
-
-                    let link = path.read_link().unwrap();
-
-                    for component in link.components() {
-                        link_target.push(component);
-                        paths.push_back(link_target.clone());
-                    }
-                } else if path.is_dir() {
-                    continue;
-                } else if path.is_file() {
-                    if self.add_watch(WatchKind::Regular, file, &path).is_err() {
-                        return;
-                    }
-
-                    break;
-                } else {
-                    warn!(
-                        "file path to sync is a symlink to nonexistent or inaccessible location: {}",
-                        file
-                    );
-                    self.files_to_remove.push(file.clone());
-                    return;
-                }
-            }
-        } else if path.is_dir() {
-            warn!("file path to sync is a directory - skipping: {}", file);
-        } else if path.is_file() {
-            let _ = self.add_watch(WatchKind::Regular, file, &path);
-        } else {
+        if !dir_path.is_dir() {
             warn!(
-                "file path to sync is nonexistent or inaccessible - skipping: {}",
-                file
+                "file sync watcher: directory does not exist yet, watching anyway: {}",
+                group.directory
             );
         }
-    }
 
-    fn unwatch(&mut self, file: &String) {
-        if let Some(watches) = self.watched_paths.remove(file) {
-            for watch in watches.iter() {
-                self.remove_watch(watch);
-            }
-        }
-    }
+        // Canonicalize if possible (for matching events), fall back to original path
+        let canonical = dir_path
+            .canonicalize()
+            .unwrap_or_else(|_| dir_path.to_path_buf());
 
-    fn cleanup_watches(&mut self) {
-        let mut unwatch = Vec::new();
+        self.debouncer
+            .watch(&canonical, notify::RecursiveMode::NonRecursive)
+            .context(format!("watching directory {}", group.directory))?;
 
-        for (directory_path, watches) in self.watched_directories.iter() {
-            if watches.is_empty() {
-                unwatch.push(directory_path.clone());
-            }
-        }
+        self.dir_to_group
+            .insert(canonical.to_string_lossy().to_string(), group.clone());
 
-        for directory_path in unwatch.iter() {
-            let directory = directory_path.to_string_lossy().to_string();
-            if let Err(err) = self.debouncer.unwatch(&directory) {
-                warn!(
-                    "file sync watcher error remowing watch for {}: {}",
-                    directory, err
-                );
-            }
-            self.watched_directories.remove(directory_path);
-        }
-    }
-
-    fn add_watch(&mut self, kind: WatchKind, file: &String, path: &Path) -> Result<()> {
-        let path = match kind {
-            WatchKind::Regular => path.canonicalize().context("canonicalizing file path")?,
-            WatchKind::Symlink => path.to_path_buf(),
-        };
-
-        let watch = Watch {
-            kind: kind.clone(),
-            file: file.clone(),
-            path: path.clone(),
-        };
-
-        let parent_path = path.parent().context("looking up parent directory")?;
-        let parent = match kind {
-            WatchKind::Regular => parent_path.to_path_buf(),
-            WatchKind::Symlink => parent_path
-                .canonicalize()
-                .context("canonicalizing parent directory")?,
-        };
-
-        if let Some(paths) = self.watched_directories.get_mut(&parent) {
-            paths.insert(path.clone());
-        } else {
-            if let Err(err) = self
-                .debouncer
-                .watch(&parent, notify::RecursiveMode::NonRecursive)
-            {
-                error!(
-                    "file sync watcher error adding watch {} for {}: {}",
-                    parent.to_string_lossy(),
-                    watch,
-                    err
-                );
-                if matches!(kind, WatchKind::Symlink) {
-                    self.files_to_remove.push(file.clone());
-                }
-                return Err(anyhow!("{err}"));
-            }
-
-            let mut paths = HashSet::new();
-            paths.insert(path.clone());
-            self.watched_directories.insert(parent.to_path_buf(), paths);
-        }
-
-        if let Some(watches) = self.watched_paths.get_mut(file) {
-            watches.insert(watch.clone());
-        } else {
-            let mut watches = HashSet::new();
-            watches.insert(watch.clone());
-            self.watched_paths.insert(file.clone(), watches);
-        }
-
-        self.watches.insert(path.clone(), watch.clone());
-
-        if matches!(kind, WatchKind::Regular) {
-            self.notifications.push_back(watch);
-        }
+        info!(
+            "file sync watcher: watching directory {} ({} files)",
+            group.directory,
+            group.files.len()
+        );
 
         Ok(())
     }
 
-    fn remove_watch(&mut self, watch: &Watch) {
-        let path = &watch.path;
-
-        let parent = path.parent().unwrap();
-
-        if let Some(paths) = self.watched_directories.get_mut(parent) {
-            paths.remove(path);
+    pub async fn run(&mut self, sender: mpsc::UnboundedSender<DirectoryGroup>) {
+        // Emit all groups immediately for initial sync
+        for group in self.dir_to_group.values() {
+            if let Err(err) = sender.send(group.clone()) {
+                error!(
+                    "file sync watcher: error sending initial group for {}: {}",
+                    group.directory, err
+                );
+            }
         }
 
-        self.watches.remove(path);
+        loop {
+            tokio::select! {
+                event = self.receiver.recv() => match event {
+                    Some(ref event) => {
+                        self.handle_event(event, &sender);
+                    }
+                    None => {
+                        error!("file sync watcher: event channel closed");
+                        break;
+                    }
+                },
+                _ = sleep(DIRECTORY_WATCH_DEBOUNCE_INTERVAL) => {
+                    // Periodic wake-up in case events were missed
+                    continue;
+                }
+            }
+        }
     }
 
-    fn handle_event(&mut self, path: &PathBuf, event: &DebouncedEvent) {
-        let watch = if let Some(watch) = self.watches.get(path) {
-            watch.clone()
-        } else {
-            return;
-        };
-
-        let mut notify = false;
-
-        let refresh_watch = match event.kind {
+    fn handle_event(
+        &self,
+        event: &DebouncedEvent,
+        sender: &mpsc::UnboundedSender<DirectoryGroup>,
+    ) {
+        let dominated = matches!(
+            event.kind,
             notify::event::EventKind::Create(_)
-            | notify::event::EventKind::Modify(notify::event::ModifyKind::Name(
-                notify::event::RenameMode::Both,
-            ))
-            | notify::event::EventKind::Modify(notify::event::ModifyKind::Name(
-                notify::event::RenameMode::To,
-            )) => {
-                let is_symlink = path.is_symlink();
-                if !is_symlink && !path.is_file() {
-                    warn!(
-                        "file path to sync has become invalid or inaccessible - removing watch for {}",
-                        watch.file
-                    );
-                    self.files_to_remove.push(watch.file.clone());
-                    return;
-                }
-                match watch.kind {
-                    WatchKind::Regular => {
-                        if is_symlink {
-                            true
-                        } else {
-                            notify = true;
-                            false
-                        }
-                    }
-                    WatchKind::Symlink => true,
-                }
-            }
-            notify::event::EventKind::Modify(notify::event::ModifyKind::Data(_)) => {
-                match watch.kind {
-                    WatchKind::Regular => {
-                        notify = true;
-                        false
-                    }
-                    WatchKind::Symlink => true,
-                }
-            }
-            notify::event::EventKind::Remove(_) => match watch.kind {
-                WatchKind::Regular => false,
-                WatchKind::Symlink => true,
-            },
-            _ => false,
-        };
+                | notify::event::EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::Both,
+                ))
+                | notify::event::EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::To,
+                ))
+                | notify::event::EventKind::Modify(notify::event::ModifyKind::Data(_))
+        );
 
-        if notify {
-            self.notifications.push_back(watch.clone());
+        if !dominated {
+            return;
         }
 
-        if refresh_watch {
-            self.files_to_remove.push(watch.file.clone());
-            self.files_to_add.push(watch.file.clone());
+        // Find which directory group this event belongs to by checking event paths
+        for path in event.paths.iter() {
+            let parent = match path.parent() {
+                Some(p) => p.to_string_lossy().to_string(),
+                None => continue,
+            };
+
+            if let Some(group) = self.dir_to_group.get(&parent) {
+                info!(
+                    "file sync watcher: change detected in {}, syncing {} files",
+                    group.directory,
+                    group.files.len()
+                );
+                if let Err(err) = sender.send(group.clone()) {
+                    error!(
+                        "file sync watcher: error sending group for {}: {}",
+                        group.directory, err
+                    );
+                }
+                // Only emit once per event even if multiple paths match the same group
+                return;
+            }
         }
     }
 }
 
-pub async fn sync_watched_file(cid: u32, watch: &Watch) -> Result<()> {
-    let mut conn = Box::pin(VsockStream::connect(cid, FILE_SYNC_PORT).await?);
-    let mut file = File::open(&watch.path).await?;
+// --- Changeset transfer (host side) ---
 
-    let metadata = file.metadata().await?;
-    let meta = Metadata {
-        path: watch.file.clone(),
-        size: metadata.len(),
+pub async fn sync_directory_group(conn: &mut VsockStream, group: &DirectoryGroup) -> Result<()> {
+    // Phase 1: resolve all files and collect metadata
+    let mut entries = Vec::with_capacity(group.files.len());
+    let mut file_paths = Vec::with_capacity(group.files.len());
+
+    for (manifest_path, filename) in &group.files {
+        let path = Path::new(manifest_path);
+
+        // Follow symlinks to get actual content
+        let resolved = match tokio::fs::canonicalize(path).await {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(
+                    "file sync: cannot resolve {}, skipping changeset for {}: {}",
+                    manifest_path, group.directory, err
+                );
+                return Ok(());
+            }
+        };
+
+        let metadata = match tokio::fs::metadata(&resolved).await {
+            Ok(m) => m,
+            Err(err) => {
+                warn!(
+                    "file sync: cannot stat {}, skipping changeset for {}: {}",
+                    manifest_path, group.directory, err
+                );
+                return Ok(());
+            }
+        };
+
+        entries.push(FileEntry {
+            name: filename.clone(),
+            manifest_path: manifest_path.clone(),
+            size: metadata.len(),
+        });
+        file_paths.push(resolved);
+    }
+
+    info!(
+        "syncing directory group {} ({} files)",
+        group.directory,
+        entries.len()
+    );
+
+    // Phase 2: send ChangesetBegin
+    let begin = SyncMessage::ChangesetBegin {
+        directory: group.directory.clone(),
+        files: entries.clone(),
     };
+    SyncMessage::send(&begin, conn).await?;
 
-    info!("syncing file: {}", watch);
+    // Phase 3: send file contents in order
+    for (i, entry) in entries.iter().enumerate() {
+        let mut file = File::open(&file_paths[i]).await.context(format!(
+            "opening file {} for sync",
+            entry.manifest_path
+        ))?;
 
-    Metadata::send(&meta, &mut conn).await?;
-    if meta.size > 0 {
-        let mut writer = FramedWrite::new(conn, BytesCodec::new());
         let mut buffer = [0u8; SYNC_IO_BUFFER_SIZE];
-        loop {
-            let n = file.read(&mut buffer).await?;
+        let mut bytes_remaining = entry.size;
+
+        while bytes_remaining > 0 {
+            let to_read = std::cmp::min(bytes_remaining as usize, SYNC_IO_BUFFER_SIZE);
+            let n = file.read(&mut buffer[..to_read]).await?;
             if n == 0 {
                 break;
             }
-            writer.send(Bytes::copy_from_slice(&buffer[..n])).await?;
+            conn.write_all(&buffer[..n]).await?;
+            bytes_remaining -= n as u64;
         }
     }
 
-    Ok(())
+    // Phase 4: send ChangesetEnd
+    let end = SyncMessage::ChangesetEnd {
+        directory: group.directory.clone(),
+    };
+    SyncMessage::send(&end, conn).await?;
+
+    // Phase 5: wait for ChangesetAck
+    let ack: SyncMessage = SyncMessage::recv(conn).await?;
+    match ack {
+        SyncMessage::ChangesetAck {
+            directory: _,
+            success: true,
+            ..
+        } => {
+            info!("file sync: changeset for {} acknowledged", group.directory);
+            Ok(())
+        }
+        SyncMessage::ChangesetAck {
+            directory: _,
+            success: false,
+            error,
+            ..
+        } => {
+            let err_msg = error.unwrap_or_else(|| "unknown error".to_string());
+            Err(anyhow::anyhow!(
+                "file sync: changeset for {} failed: {}",
+                group.directory,
+                err_msg
+            ))
+        }
+        other => Err(anyhow::anyhow!(
+            "file sync: unexpected message after changeset: {:?}",
+            other
+        )),
+    }
+}
+
+pub async fn send_initial_sync_complete(conn: &mut VsockStream) -> Result<()> {
+    SyncMessage::send(&SyncMessage::InitialSyncComplete, conn).await?;
+
+    let ack: SyncMessage = SyncMessage::recv(conn).await?;
+    match ack {
+        SyncMessage::InitialSyncAck => {
+            info!("file sync: initial sync complete acknowledged by enclave");
+            Ok(())
+        }
+        other => Err(anyhow::anyhow!(
+            "file sync: unexpected message after InitialSyncComplete: {:?}",
+            other
+        )),
+    }
 }
