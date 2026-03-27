@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use log::{error, info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use notify_debouncer_full::{
@@ -179,8 +179,15 @@ impl DirectoryGroupWatcher {
         loop {
             tokio::select! {
                 event = self.receiver.recv() => match event {
-                    Some(ref event) => {
-                        self.handle_event(event, &sender);
+                    Some(first_event) => {
+                        // Collect the first event plus all pending events, then
+                        // deduplicate by directory group to avoid redundant syncs
+                        // from multiple fs events in the same K8s atomic update.
+                        let mut events = vec![first_event];
+                        while let Ok(event) = self.receiver.try_recv() {
+                            events.push(event);
+                        }
+                        self.emit_groups_for_events(&events, &sender);
                     }
                     None => {
                         error!("file sync watcher: event channel closed");
@@ -195,44 +202,54 @@ impl DirectoryGroupWatcher {
         }
     }
 
-    fn handle_event(&self, event: &DebouncedEvent, sender: &mpsc::UnboundedSender<DirectoryGroup>) {
-        let dominated = matches!(
-            event.kind,
-            notify::event::EventKind::Create(_)
-                | notify::event::EventKind::Modify(notify::event::ModifyKind::Name(
-                    notify::event::RenameMode::Both,
-                ))
-                | notify::event::EventKind::Modify(notify::event::ModifyKind::Name(
-                    notify::event::RenameMode::To,
-                ))
-                | notify::event::EventKind::Modify(notify::event::ModifyKind::Data(_))
-        );
+    /// Resolve a batch of filesystem events to unique directory groups and emit each once.
+    fn emit_groups_for_events(
+        &self,
+        events: &[DebouncedEvent],
+        sender: &mpsc::UnboundedSender<DirectoryGroup>,
+    ) {
+        let mut emitted = HashSet::new();
 
-        if !dominated {
-            return;
-        }
+        for event in events {
+            let dominated = matches!(
+                event.kind,
+                notify::event::EventKind::Create(_)
+                    | notify::event::EventKind::Modify(notify::event::ModifyKind::Name(
+                        notify::event::RenameMode::Both,
+                    ))
+                    | notify::event::EventKind::Modify(notify::event::ModifyKind::Name(
+                        notify::event::RenameMode::To,
+                    ))
+                    | notify::event::EventKind::Modify(notify::event::ModifyKind::Data(_))
+            );
 
-        // Find which directory group this event belongs to by checking event paths
-        for path in event.paths.iter() {
-            let parent = match path.parent() {
-                Some(p) => p.to_string_lossy().to_string(),
-                None => continue,
-            };
+            if !dominated {
+                continue;
+            }
 
-            if let Some(group) = self.dir_to_group.get(&parent) {
-                info!(
-                    "file sync watcher: change detected in {}, syncing {} files",
-                    group.directory,
-                    group.files.len()
-                );
-                if let Err(err) = sender.send(group.clone()) {
-                    error!(
-                        "file sync watcher: error sending group for {}: {err}",
+            for path in event.paths.iter() {
+                let parent = match path.parent() {
+                    Some(p) => p.to_string_lossy().to_string(),
+                    None => continue,
+                };
+
+                if let Some(group) = self.dir_to_group.get(&parent) {
+                    if !emitted.insert(&group.directory) {
+                        continue;
+                    }
+
+                    info!(
+                        "file sync watcher: change detected in {}, syncing {} files",
                         group.directory,
+                        group.files.len()
                     );
+                    if let Err(err) = sender.send(group.clone()) {
+                        error!(
+                            "file sync watcher: error sending group for {}: {err}",
+                            group.directory,
+                        );
+                    }
                 }
-                // Only emit once per event even if multiple paths match the same group
-                return;
             }
         }
     }
