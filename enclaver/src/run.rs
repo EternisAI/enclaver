@@ -274,10 +274,7 @@ impl Enclave {
         let mut watcher = files::DirectoryGroupWatcher::new(&groups)?;
         let (group_tx, mut group_rx) = mpsc::unbounded_channel::<files::DirectoryGroup>();
 
-        info!(
-            "starting file sync watcher for {} directory groups",
-            total_groups
-        );
+        info!("starting file sync watcher for {total_groups} directory groups");
         self.tasks
             .push(utils::spawn!("file sync watcher", async move {
                 watcher.run(group_tx).await;
@@ -300,7 +297,7 @@ impl Enclave {
 
                 while let Some(ref group) = group_rx.recv().await {
                     if let Err(err) = files::sync_directory_group(&mut conn, group).await {
-                        error!("file sync error for {}: {}", group.directory, err);
+                        error!("file sync error for {}: {err}", group.directory);
                         // On connection error, reconnect and re-sync everything
                         info!("file sync: reconnecting to enclave");
                         conn = loop {
@@ -318,7 +315,7 @@ impl Enclave {
                         synced_groups.insert(group.directory.clone());
                         if synced_groups.len() >= total_groups {
                             if let Err(err) = files::send_initial_sync_complete(&mut conn).await {
-                                error!("file sync: error sending initial sync complete: {}", err);
+                                error!("file sync: error sending initial sync complete: {err}");
                             } else {
                                 initial_sync_done = true;
                             }

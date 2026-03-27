@@ -88,7 +88,7 @@ impl FileSyncServer {
                             error: None,
                         },
                         Err(ref err) => {
-                            error!("File sync: changeset for {} failed: {}", directory, err);
+                            error!("File sync: changeset for {directory} failed: {err}");
                             SyncMessage::ChangesetAck {
                                 directory: directory.clone(),
                                 success: false,
@@ -108,7 +108,7 @@ impl FileSyncServer {
                     }
                 }
                 other => {
-                    warn!("File sync: unexpected message: {:?}", other);
+                    warn!("File sync: unexpected message: {other:?}");
                 }
             }
         }
@@ -125,7 +125,7 @@ impl FileSyncServer {
         // Step 1: Ensure target directory exists
         fs::create_dir_all(dir_path)
             .await
-            .context(format!("creating target directory {}", directory))?;
+            .context(format!("creating target directory {directory}"))?;
 
         // Step 2: Create timestamped directory
         let now = chrono::Utc::now();
@@ -138,9 +138,7 @@ impl FileSyncServer {
         ))?;
 
         info!(
-            "File sync: receiving changeset for {} -> {} ({} files)",
-            directory,
-            ts_dir_name,
+            "File sync: receiving changeset for {directory} -> {ts_dir_name} ({} files)",
             file_entries.len()
         );
 
@@ -149,10 +147,7 @@ impl FileSyncServer {
 
         if let Err(err) = &write_result {
             // Cleanup incomplete timestamped directory on error
-            error!(
-                "File sync: error receiving files for {}, cleaning up: {}",
-                directory, err
-            );
+            error!("File sync: error receiving files for {directory}, cleaning up: {err}");
             let _ = fs::remove_dir_all(&ts_dir_path).await;
             // Still need to read ChangesetEnd to keep protocol in sync
             let _end: SyncMessage = SyncMessage::recv(conn).await?;
@@ -166,9 +161,7 @@ impl FileSyncServer {
             _ => {
                 let _ = fs::remove_dir_all(&ts_dir_path).await;
                 return Err(anyhow!(
-                    "expected ChangesetEnd for {}, got {:?}",
-                    directory,
-                    end_msg
+                    "expected ChangesetEnd for {directory}, got {end_msg:?}"
                 ));
             }
         }
@@ -227,9 +220,8 @@ impl FileSyncServer {
             let old_path = dir_path.join(old_ts_dir);
             if let Err(err) = fs::remove_dir_all(&old_path).await {
                 warn!(
-                    "File sync: failed to clean up old directory {}: {}",
+                    "File sync: failed to clean up old directory {}: {err}",
                     old_path.display(),
-                    err
                 );
             }
         }
@@ -237,7 +229,7 @@ impl FileSyncServer {
         // Step 9: Update state
         state.current_ts_dir = Some(ts_dir_name.clone());
 
-        info!("File sync: changeset for {} complete", directory);
+        info!("File sync: changeset for {directory} complete");
 
         Ok(())
     }
@@ -294,7 +286,7 @@ impl FileSyncService {
             .manifest
             .files
             .as_ref()
-            .map_or(false, |f| !f.is_empty());
+            .is_some_and(|f| !f.is_empty());
 
         let task = if !has_files {
             None

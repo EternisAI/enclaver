@@ -66,7 +66,7 @@ pub fn group_files_by_directory(manifest_files: &[String]) -> HashMap<String, Di
         let filename = match path.file_name() {
             Some(name) => name.to_string_lossy().to_string(),
             None => {
-                warn!("file path to sync has no filename component: {}", file_path);
+                warn!("file path to sync has no filename component: {file_path}");
                 continue;
             }
         };
@@ -125,8 +125,8 @@ impl DirectoryGroupWatcher {
         for group in groups.values() {
             if let Err(err) = watcher.watch_directory(group) {
                 error!(
-                    "file sync watcher: failed to watch directory {}: {}",
-                    group.directory, err
+                    "file sync watcher: failed to watch directory {}: {err}",
+                    group.directory,
                 );
             }
         }
@@ -170,8 +170,8 @@ impl DirectoryGroupWatcher {
         for group in self.dir_to_group.values() {
             if let Err(err) = sender.send(group.clone()) {
                 error!(
-                    "file sync watcher: error sending initial group for {}: {}",
-                    group.directory, err
+                    "file sync watcher: error sending initial group for {}: {err}",
+                    group.directory,
                 );
             }
         }
@@ -227,8 +227,8 @@ impl DirectoryGroupWatcher {
                 );
                 if let Err(err) = sender.send(group.clone()) {
                     error!(
-                        "file sync watcher: error sending group for {}: {}",
-                        group.directory, err
+                        "file sync watcher: error sending group for {}: {err}",
+                        group.directory,
                     );
                 }
                 // Only emit once per event even if multiple paths match the same group
@@ -253,8 +253,8 @@ pub async fn sync_directory_group(conn: &mut VsockStream, group: &DirectoryGroup
             Ok(p) => p,
             Err(err) => {
                 warn!(
-                    "file sync: cannot resolve {}, skipping changeset for {}: {}",
-                    manifest_path, group.directory, err
+                    "file sync: cannot resolve {manifest_path}, skipping changeset for {}: {err}",
+                    group.directory,
                 );
                 return Ok(());
             }
@@ -264,8 +264,8 @@ pub async fn sync_directory_group(conn: &mut VsockStream, group: &DirectoryGroup
             Ok(m) => m,
             Err(err) => {
                 warn!(
-                    "file sync: cannot stat {}, skipping changeset for {}: {}",
-                    manifest_path, group.directory, err
+                    "file sync: cannot stat {manifest_path}, skipping changeset for {}: {err}",
+                    group.directory,
                 );
                 return Ok(());
             }
@@ -337,14 +337,12 @@ pub async fn sync_directory_group(conn: &mut VsockStream, group: &DirectoryGroup
         } => {
             let err_msg = error.unwrap_or_else(|| "unknown error".to_string());
             Err(anyhow::anyhow!(
-                "file sync: changeset for {} failed: {}",
+                "file sync: changeset for {} failed: {err_msg}",
                 group.directory,
-                err_msg
             ))
         }
         other => Err(anyhow::anyhow!(
-            "file sync: unexpected message after changeset: {:?}",
-            other
+            "file sync: unexpected message after changeset: {other:?}"
         )),
     }
 }
@@ -359,8 +357,7 @@ pub async fn send_initial_sync_complete(conn: &mut VsockStream) -> Result<()> {
             Ok(())
         }
         other => Err(anyhow::anyhow!(
-            "file sync: unexpected message after InitialSyncComplete: {:?}",
-            other
+            "file sync: unexpected message after InitialSyncComplete: {other:?}"
         )),
     }
 }
