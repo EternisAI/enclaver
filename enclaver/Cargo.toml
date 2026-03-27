@@ -1,6 +1,6 @@
 [package]
 name = "enclaver"
-version = "0.5.0-eternis.4"
+version = "0.5.0-eternis.5"
 edition = "2021"
 rust-version = "1.88"
 default-run = "enclaver"
