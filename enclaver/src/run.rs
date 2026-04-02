@@ -2,7 +2,11 @@ use crate::constants::{
     APP_LOG_PORT, EIF_FILE_NAME, ENV_SYNC_PORT, FILE_SYNC_PORT, HTTP_EGRESS_VSOCK_PORT,
     MANIFEST_FILE_NAME, RELEASE_BUNDLE_DIR, STATUS_PORT,
 };
+use crate::files;
 use crate::manifest::{load_manifest, Defaults, Manifest};
+use crate::nitro_cli::{EnclaveInfo, NitroCLI, RunEnclaveArgs};
+use crate::proxy::egress_http::HostHttpProxy;
+use crate::proxy::ingress::HostProxy;
 use crate::utils;
 use anyhow::{anyhow, Result};
 use futures_util::stream::StreamExt;
@@ -17,12 +21,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::sync::CancellationToken;
-use tokio_vsock::VsockStream;
-
-use crate::files;
-use crate::nitro_cli::{EnclaveInfo, NitroCLI, RunEnclaveArgs};
-use crate::proxy::egress_http::HostHttpProxy;
-use crate::proxy::ingress::HostProxy;
 
 const ENV_VSOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const FILE_VSOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -240,9 +238,8 @@ impl Enclave {
                     .push(utils::spawn!("sync environment", async move {
                         info!("waiting for enclave to boot to sync environment");
                         let mut conn = loop {
-                            match VsockStream::connect(cid, ENV_SYNC_PORT).await {
+                            match crate::vsock::connect(cid, ENV_SYNC_PORT).await {
                                 Ok(conn) => break conn,
-                                // TODO: improve the polling frequency / backoff / timeout
                                 Err(_) => tokio::time::sleep(ENV_VSOCK_RETRY_INTERVAL).await,
                             }
                         };
@@ -250,6 +247,9 @@ impl Enclave {
                         info!("connected to enclave, starting environment sync");
                         if let Err(err) = conn.write_all(env.as_bytes()).await {
                             error!("error sending environment to enclave: {err}");
+                        }
+                        if let Err(err) = conn.shutdown(std::net::Shutdown::Write) {
+                            error!("error shutting down environment sync connection: {err}");
                         }
                         info!("environment sync complete");
                     })?);
@@ -285,7 +285,7 @@ impl Enclave {
             .push(utils::spawn!("file sync client", async move {
                 info!("waiting for enclave to boot to sync files");
                 let mut conn = loop {
-                    match VsockStream::connect(cid, FILE_SYNC_PORT).await {
+                    match crate::vsock::connect(cid, FILE_SYNC_PORT).await {
                         Ok(conn) => break conn,
                         Err(_) => tokio::time::sleep(FILE_VSOCK_RETRY_INTERVAL).await,
                     }
@@ -301,7 +301,7 @@ impl Enclave {
                         // On connection error, reconnect and re-sync everything
                         info!("file sync: reconnecting to enclave");
                         conn = loop {
-                            match VsockStream::connect(cid, FILE_SYNC_PORT).await {
+                            match crate::vsock::connect(cid, FILE_SYNC_PORT).await {
                                 Ok(conn) => break conn,
                                 Err(_) => tokio::time::sleep(FILE_VSOCK_RETRY_INTERVAL).await,
                             }
@@ -332,7 +332,7 @@ impl Enclave {
             .push(utils::spawn!("odyn log stream", async move {
                 info!("waiting for enclave to boot to stream logs");
                 let conn = loop {
-                    match VsockStream::connect(cid, APP_LOG_PORT).await {
+                    match crate::vsock::connect(cid, APP_LOG_PORT).await {
                         Ok(conn) => break conn,
 
                         // TODO: improve the polling frequency / backoff / timeout
@@ -355,7 +355,7 @@ impl Enclave {
         let mut failed_attempts = 0;
 
         loop {
-            let conn = match VsockStream::connect(cid, STATUS_PORT).await {
+            let conn = match crate::vsock::connect(cid, STATUS_PORT).await {
                 Ok(conn) => conn,
 
                 Err(_) => {

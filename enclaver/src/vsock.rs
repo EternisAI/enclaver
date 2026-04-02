@@ -73,13 +73,24 @@ pub fn tls_serve(
     Ok(stream)
 }
 
+/// Connect to a vsock peer, with a workaround for a tokio-vsock bug where
+/// `VsockStream::connect` can return `Ok` even when the connection was not
+/// actually established. We validate with `peer_addr()` immediately after.
+pub async fn connect(cid: u32, port: u32) -> std::io::Result<VsockStream> {
+    let stream = VsockStream::connect(cid, port).await?;
+    // bug in VsockStream::connect: it can return Ok even if connect failed.
+    // Validate with peer_addr() to detect phantom connections.
+    stream.peer_addr()?;
+    Ok(stream)
+}
+
 pub async fn tls_connect(
     cid: u32,
     port: u32,
     name: ServerName<'static>,
     tls_config: Arc<ClientConfig>,
 ) -> Result<TlsClientStream> {
-    let stream = VsockStream::connect(cid, port).await?;
+    let stream = connect(cid, port).await?;
     let connector = TlsConnector::from(tls_config);
     let tls_stream = connector.connect(name, stream).await?;
     Ok(tls_stream)

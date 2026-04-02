@@ -109,7 +109,7 @@ impl HostProxy {
 
     async fn service_conn(mut tcp: TcpStream, target_cid: u32, target_port: u32) {
         debug!("Connecting to CID={target_cid} port={target_port}");
-        match VsockStream::connect(target_cid, target_port).await {
+        match crate::vsock::connect(target_cid, target_port).await {
             Ok(mut vsock) => {
                 debug!("Connected to {target_port}:{target_cid}, proxying data");
                 _ = tokio::io::copy_bidirectional(&mut vsock, &mut tcp).await;

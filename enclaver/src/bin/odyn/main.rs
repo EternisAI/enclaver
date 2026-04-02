@@ -93,45 +93,51 @@ async fn sync_environment(config: &Configuration) -> Result<HashMap<String, Stri
 
             let mut incoming = enclaver::vsock::serve(ENV_SYNC_PORT)?;
 
-            match time::timeout(ENV_SYNC_TIMEOUT, incoming.next()).await {
-                Ok(Some(mut sock)) => {
-                    let mut env_buf: Vec<u8> = Vec::new();
-                    let mut read_buf = vec![0u8; 1024];
-                    const ARG_MAX: usize = 128 * 1024;
-
-                    loop {
-                        match time::timeout(ENV_SYNC_TIMEOUT, sock.read(&mut read_buf)).await {
-                            Ok(Ok(0)) => break,
-                            Ok(Ok(n)) => {
-                                if env_buf.len() + n > ARG_MAX {
-                                    return Err(anyhow!("Maximum environment size exceeded"));
-                                }
-                                env_buf.extend_from_slice(&read_buf[..n]);
-                            }
-                            Ok(Err(err)) => {
-                                return Err(anyhow!("Error reading environment: {:#}", err))
-                            }
-                            Err(_) => return Err(anyhow!("Timed out while reading environment")),
-                        }
+            // Accept connections in a loop: if a connection turns out to be broken
+            // (e.g., due to a tokio-vsock connect bug where the host's connect()
+            // returns Ok before the listener was ready), retry with the next one.
+            let env_buf = 'accept: loop {
+                let mut sock = match time::timeout(ENV_SYNC_TIMEOUT, incoming.next()).await {
+                    Ok(Some(sock)) => sock,
+                    Ok(None) => {
+                        return Err(anyhow!(
+                            "Failed to accept environment sync vsock connection"
+                        ));
                     }
+                    Err(_) => {
+                        return Err(anyhow!("Timed out while waiting for environment sync"));
+                    }
+                };
 
-                    let mut synced_env: HashMap<String, String> = serde_json::from_slice(&env_buf)
-                        .context("Failed to parse the synced environment")?;
+                let mut env_buf: Vec<u8> = Vec::new();
+                let mut read_buf = vec![0u8; 1024];
+                const ARG_MAX: usize = 128 * 1024;
 
-                    for k in keys.iter() {
-                        if let Some(v) = synced_env.remove(k) {
-                            info!("Syncing environment variable: {}", k);
-                            env.insert(k.clone(), v);
+                loop {
+                    match time::timeout(ENV_SYNC_TIMEOUT, sock.read(&mut read_buf)).await {
+                        Ok(Ok(0)) => break 'accept env_buf,
+                        Ok(Ok(n)) => {
+                            if env_buf.len() + n > ARG_MAX {
+                                return Err(anyhow!("Maximum environment size exceeded"));
+                            }
+                            env_buf.extend_from_slice(&read_buf[..n]);
                         }
+                        Ok(Err(err)) => {
+                            warn!("Error reading environment, will retry: {:#}", err);
+                            continue 'accept;
+                        }
+                        Err(_) => return Err(anyhow!("Timed out while reading environment")),
                     }
                 }
-                Ok(None) => {
-                    return Err(anyhow!(
-                        "Failed to accept environment sync vsock connection"
-                    ));
-                }
-                Err(_) => {
-                    return Err(anyhow!("Timed out while waiting for environment sync"));
+            };
+
+            let mut synced_env: HashMap<String, String> = serde_json::from_slice(&env_buf)
+                .context("Failed to parse the synced environment")?;
+
+            for k in keys.iter() {
+                if let Some(v) = synced_env.remove(k) {
+                    info!("Syncing environment variable: {}", k);
+                    env.insert(k.clone(), v);
                 }
             }
 

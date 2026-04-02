@@ -336,7 +336,7 @@ fn is_empty(pq: Option<&PathAndQuery>) -> bool {
 // connects to the host via vsock and then asks it to
 // connect to the remote address
 async fn remote_connect(egress_port: u32, host: &str, port: u16) -> anyhow::Result<VsockStream> {
-    let mut vsock = VsockStream::connect(crate::vsock::VMADDR_CID_HOST, egress_port).await?;
+    let mut vsock = crate::vsock::connect(crate::vsock::VMADDR_CID_HOST, egress_port).await?;
     debug!(
         "Connected to vsock {}:{}, sending connect request",
         crate::vsock::VMADDR_CID_HOST,

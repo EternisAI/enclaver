@@ -513,9 +513,7 @@ mod tests {
     }
 
     async fn app_status_lines() -> Result<Lines<impl AsyncBufRead + Unpin>> {
-        let sock = VsockStream::connect(enclaver::vsock::VMADDR_CID_HOST, STATUS_PORT).await?;
-        // bug in VsockStream::connect: it can return Ok even if connect failed
-        _ = sock.peer_addr()?;
+        let sock = enclaver::vsock::connect(enclaver::vsock::VMADDR_CID_HOST, STATUS_PORT).await?;
         Ok(BufReader::new(sock).lines())
     }
 
