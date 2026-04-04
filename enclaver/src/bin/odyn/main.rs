@@ -83,7 +83,7 @@ async fn launch(args: &CliArgs) -> Result<launcher::ExitStatus> {
 
 async fn sync_environment(config: &Configuration) -> Result<HashMap<String, String>> {
     use futures::stream::StreamExt;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut env: HashMap<String, String> = HashMap::new();
 
@@ -115,7 +115,12 @@ async fn sync_environment(config: &Configuration) -> Result<HashMap<String, Stri
 
                 loop {
                     match time::timeout(ENV_SYNC_TIMEOUT, sock.read(&mut read_buf)).await {
-                        Ok(Ok(0)) => break 'accept env_buf,
+                        Ok(Ok(0)) => {
+                            // Ack to the host so it knows data was received
+                            // and doesn't retry on a phantom connection.
+                            let _ = sock.write_all(&[0x06]).await;
+                            break 'accept env_buf;
+                        }
                         Ok(Ok(n)) => {
                             if env_buf.len() + n > ARG_MAX {
                                 return Err(anyhow!("Maximum environment size exceeded"));

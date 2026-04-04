@@ -10,14 +10,14 @@ use crate::proxy::ingress::HostProxy;
 use crate::utils;
 use anyhow::{anyhow, Result};
 use futures_util::stream::StreamExt;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::sync::CancellationToken;
@@ -27,6 +27,7 @@ const FILE_VSOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const LOG_VSOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_VSOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_VSOCK_RETRY_LIMIT: i32 = 100;
+const FILE_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DEFAULT_CPU_COUNT: i32 = 2;
 const DEFAULT_MEMORY_MB: i32 = 4096;
@@ -237,20 +238,50 @@ impl Enclave {
                 self.tasks
                     .push(utils::spawn!("sync environment", async move {
                         info!("waiting for enclave to boot to sync environment");
-                        let mut conn = loop {
-                            match crate::vsock::connect(cid, ENV_SYNC_PORT).await {
-                                Ok(conn) => break conn,
-                                Err(_) => tokio::time::sleep(ENV_VSOCK_RETRY_INTERVAL).await,
-                            }
-                        };
 
-                        info!("connected to enclave, starting environment sync");
-                        if let Err(err) = conn.write_all(env.as_bytes()).await {
-                            error!("error sending environment to enclave: {err}");
+                        // Retry the entire connect-write-ack cycle: if we connected
+                        // to a phantom (tokio-vsock bug), the ack will fail/timeout
+                        // and we'll retry with a fresh connection.
+                        'sync: loop {
+                            let mut conn = loop {
+                                match crate::vsock::connect(cid, ENV_SYNC_PORT).await {
+                                    Ok(conn) => break conn,
+                                    Err(_) => tokio::time::sleep(ENV_VSOCK_RETRY_INTERVAL).await,
+                                }
+                            };
+
+                            info!("connected to enclave, starting environment sync");
+                            if let Err(err) = conn.write_all(env.as_bytes()).await {
+                                warn!("environment sync write failed: {err}, retrying");
+                                tokio::time::sleep(ENV_VSOCK_RETRY_INTERVAL).await;
+                                continue;
+                            }
+                            if let Err(err) = conn.shutdown(std::net::Shutdown::Write) {
+                                warn!("environment sync shutdown failed: {err}, retrying");
+                                tokio::time::sleep(ENV_VSOCK_RETRY_INTERVAL).await;
+                                continue;
+                            }
+
+                            // Wait for ack from enclave to confirm data was received.
+                            // On phantom connections the data goes nowhere, so no ack arrives.
+                            let mut ack = [0u8; 1];
+                            match tokio::time::timeout(
+                                Duration::from_secs(5),
+                                conn.read_exact(&mut ack),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => break 'sync,
+                                Ok(Err(err)) => {
+                                    warn!("environment sync ack failed: {err}, retrying");
+                                }
+                                Err(_) => {
+                                    warn!("environment sync ack timed out, retrying");
+                                }
+                            }
+                            tokio::time::sleep(ENV_VSOCK_RETRY_INTERVAL).await;
                         }
-                        if let Err(err) = conn.shutdown(std::net::Shutdown::Write) {
-                            error!("error shutting down environment sync connection: {err}");
-                        }
+
                         info!("environment sync complete");
                     })?);
             }
@@ -296,9 +327,24 @@ impl Enclave {
                 let mut initial_sync_done = false;
 
                 while let Some(ref group) = group_rx.recv().await {
-                    if let Err(err) = files::sync_directory_group(&mut conn, group).await {
-                        error!("file sync error for {}: {err}", group.directory);
-                        // On connection error, reconnect and re-sync everything
+                    let needs_reconnect = match tokio::time::timeout(
+                        FILE_SYNC_TIMEOUT,
+                        files::sync_directory_group(&mut conn, group),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => false,
+                        Ok(Err(err)) => {
+                            error!("file sync error for {}: {err}", group.directory);
+                            true
+                        }
+                        Err(_) => {
+                            error!("file sync timed out for {}", group.directory);
+                            true
+                        }
+                    };
+
+                    if needs_reconnect {
                         info!("file sync: reconnecting to enclave");
                         conn = loop {
                             match crate::vsock::connect(cid, FILE_SYNC_PORT).await {
@@ -314,10 +360,33 @@ impl Enclave {
                     if !initial_sync_done {
                         synced_groups.insert(group.directory.clone());
                         if synced_groups.len() >= total_groups {
-                            if let Err(err) = files::send_initial_sync_complete(&mut conn).await {
-                                error!("file sync: error sending initial sync complete: {err}");
-                            } else {
-                                initial_sync_done = true;
+                            match tokio::time::timeout(
+                                FILE_SYNC_TIMEOUT,
+                                files::send_initial_sync_complete(&mut conn),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    initial_sync_done = true;
+                                }
+                                Ok(Err(err)) => {
+                                    error!("file sync: error sending initial sync complete: {err}");
+                                }
+                                Err(_) => {
+                                    error!(
+                                        "file sync: initial sync complete timed out, reconnecting"
+                                    );
+                                    conn = loop {
+                                        match crate::vsock::connect(cid, FILE_SYNC_PORT).await {
+                                            Ok(conn) => break conn,
+                                            Err(_) => {
+                                                tokio::time::sleep(FILE_VSOCK_RETRY_INTERVAL).await
+                                            }
+                                        }
+                                    };
+                                    synced_groups.clear();
+                                    initial_sync_done = false;
+                                }
                             }
                         }
                     }
@@ -331,20 +400,26 @@ impl Enclave {
         self.tasks
             .push(utils::spawn!("odyn log stream", async move {
                 info!("waiting for enclave to boot to stream logs");
-                let conn = loop {
-                    match crate::vsock::connect(cid, APP_LOG_PORT).await {
-                        Ok(conn) => break conn,
 
-                        // TODO: improve the polling frequency / backoff / timeout
-                        Err(_) => {
-                            tokio::time::sleep(LOG_VSOCK_RETRY_INTERVAL).await;
+                // Reconnect loop: if we hit a phantom connection (immediate EOF)
+                // or the stream breaks, reconnect to avoid losing logs.
+                loop {
+                    let conn = loop {
+                        match crate::vsock::connect(cid, APP_LOG_PORT).await {
+                            Ok(conn) => break conn,
+                            Err(_) => {
+                                tokio::time::sleep(LOG_VSOCK_RETRY_INTERVAL).await;
+                            }
                         }
-                    }
-                };
+                    };
 
-                info!("connected to enclave, starting log stream");
-                if let Err(e) = utils::log_lines_from_stream("enclave", conn).await {
-                    error!("error reading log lines from enclave: {e}");
+                    info!("connected to enclave, starting log stream");
+                    if let Err(e) = utils::log_lines_from_stream("enclave", conn).await {
+                        error!("error reading log lines from enclave: {e}");
+                    }
+
+                    warn!("enclave log stream ended, reconnecting");
+                    tokio::time::sleep(LOG_VSOCK_RETRY_INTERVAL).await;
                 }
             })?);
 
